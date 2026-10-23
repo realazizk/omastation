@@ -1,0 +1,16 @@
+# Grabs the desk's input devices while the session of UID %i is served remotely.
+#   systemctl enable --now omastation-helper@$(id -u)
+[Unit]
+Description=omastation: desk input fence for the session of UID %i
+
+[Service]
+ExecStart=/usr/bin/omastation helper %i /run/omastation/helper.sock
+RuntimeDirectory=omastation
+Restart=on-failure
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=yes
+ProtectSystem=strict
+
+[Install]
+WantedBy=multi-user.target

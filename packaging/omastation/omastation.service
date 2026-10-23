@@ -1,0 +1,15 @@
+[Unit]
+Description=omastation: RDP server for this Hyprland session
+PartOf=graphical-session.target
+After=graphical-session.target
+Requisite=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/omastation --desktop
+# Locks the session and restores the monitors after a stop or crash mid-session.
+ExecStopPost=/usr/lib/omastation/omastation-recover
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

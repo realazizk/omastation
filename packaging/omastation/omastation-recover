@@ -1,0 +1,145 @@
+#!/bin/sh
+# ExecStopPost of omastation.service: unloads the plugin and, if omastation
+# stopped mid-session, undoes what it changed (state in $XDG_RUNTIME_DIR/omastation):
+# key bindings, Option + drag bindings, muted speakers, the default source,
+# drive mounts, the RDP outputs (locking the session before the monitors come back).
+rt=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
+state=$rt/omastation
+
+# The plugin: the recorded copy, any other copy, and the package's path.
+record=$state/plugin-loaded
+if [ -f "$record" ]; then
+	IFS= read -r loaded <"$record" || loaded=
+	case $loaded in
+	*[[:space:]]*) ;;
+	/*) hyprctl plugin unload "$loaded" >/dev/null 2>&1 ;;
+	esac
+	rm -f "$record"
+fi
+for copy in "$state"/plugin/omastation-plugin-*.so; do
+	[ -f "$copy" ] || continue
+	hyprctl plugin unload "$copy" >/dev/null 2>&1
+	rm -f "$copy"
+done
+hyprctl plugin unload /usr/lib/omastation/omastation-plugin.so >/dev/null 2>&1
+# Key bindings and key repeat back on for omastation's virtual keyboards.
+rate=$(hyprctl -j getoption input:repeat_rate 2>/dev/null | jq -r '.int // 25' 2>/dev/null)
+case $rate in '' | *[!0-9]*) rate=25 ;; esac
+delay=$(hyprctl -j getoption input:repeat_delay 2>/dev/null | jq -r '.int // 600' 2>/dev/null)
+case $delay in '' | *[!0-9]*) delay=600 ;; esac
+for n in "" -1 -2 -3 -4 -5 -6 -7 -8; do
+	hyprctl eval "hl.device({ name = \"hl-virtual-keyboard-omastation$n\", keybinds = true, repeat_rate = $rate, repeat_delay = $delay })" >/dev/null 2>&1
+done
+
+binds=$state/alt-drag-binds
+if [ -f "$binds" ]; then
+	while IFS= read -r keys; do
+		case $keys in
+		*mouse:*) ;;
+		*) continue ;;
+		esac
+		case $keys in
+		*'"'* | *'\'*) continue ;;
+		esac
+		hyprctl eval "hl.unbind(\"$keys\")" >/dev/null 2>&1
+	done <"$binds"
+	rm -f "$binds"
+fi
+
+# Unmute exactly the sinks omastation muted.
+muted=$state/desk-muted
+if [ -f "$muted" ]; then
+	echo "omastation stopped during a remote session: unmuting the desk's speakers" >&2
+	while IFS= read -r sink; do
+		[ -n "$sink" ] || continue
+		node=$(pw-dump 2>/dev/null | jq -r --arg n "$sink" '.[] | select(.info.props["node.name"] == $n) | .id' | head -1)
+		[ -n "$node" ] && wpctl set-mute "$node" 0 >/dev/null 2>&1
+	done <"$muted"
+	rm -f "$muted"
+fi
+
+# Put the previous default source back if it still names omastation's microphone.
+micdef=$state/mic-default
+if [ -f "$micdef" ]; then
+	key=default.configured.audio.source
+	cur=$(pw-metadata 0 "$key" 2>/dev/null | sed -n "s/.*key:'$key' value:'\([^']*\)'.*/\1/p")
+	case $cur in
+	*omastation_microphone*)
+		echo "omastation stopped with its microphone the default source: putting the previous one back" >&2
+		prev=$(cat "$micdef")
+		if [ -n "$prev" ]; then
+			pw-metadata 0 "$key" "$prev" Spa:String:JSON >/dev/null 2>&1
+		else
+			pw-metadata -d 0 "$key" >/dev/null 2>&1
+		fi
+		;;
+	esac
+	rm -f "$micdef"
+fi
+
+# FUSE mounts (drives, clipboard files) that outlived omastation, and their links.
+grep -E ' fuse(\.[a-z]+)? ' /proc/mounts | while read -r _ mnt _; do
+	case $mnt in
+	"$state"/*) fusermount3 -u -z "$(printf '%b' "$mnt")" 2>/dev/null ;;
+	esac
+done
+for d in "$state"/drives/* "$state"/clipboard/*; do
+	[ -d "$d" ] && rmdir "$d" 2>/dev/null
+done
+links=${HOME:-}/RDP\ Drives
+if [ -n "${HOME:-}" ] && [ -d "$links" ]; then
+	for l in "$links"/*; do
+		[ -L "$l" ] || continue
+		case $(readlink "$l") in
+		"$state"/drives/*) rm -f "$l" ;;
+		esac
+	done
+	rmdir "$links" 2>/dev/null
+fi
+
+outputs=$(hyprctl -j monitors all 2>/dev/null | jq -r '.[] | select(.name | startswith("RDP-")) | .name') || exit 0
+plan=$state/console-restore
+if [ -z "$outputs" ]; then
+	rm -f "$plan"
+	exit 0
+fi
+echo "omastation stopped during a remote session: locking and restoring the monitors" >&2
+hyprctl eval 'hl.exec_cmd("omarchy-system-lock")' >/dev/null
+# Never light the desk unlocked: wait (5 s at most) for Hyprland's lock.
+i=0
+while [ $i -lt 50 ]; do
+	hyprctl -j monitors 2>/dev/null | jq -e 'any(.[]; (.solitaryBlockedBy // []) | index("LOCK"))' >/dev/null && break
+	sleep 0.1
+	i=$((i + 1))
+done
+if [ -s "$plan" ]; then
+	# One IPC command per line; "wait NAME" waits until that monitor is enabled.
+	while IFS= read -r step; do
+		case $step in
+		'wait '*)
+			name=${step#wait }
+			i=0
+			while [ $i -lt 40 ]; do
+				hyprctl -j monitors 2>/dev/null | jq -e --arg n "$name" 'any(.[]; .name == $n)' >/dev/null && break
+				sleep 0.05
+				i=$((i + 1))
+			done
+			;;
+		?*) hyprctl "${step%% *}" "${step#* }" >/dev/null 2>&1 ;;
+		esac
+	done <"$plan"
+	for o in $(hyprctl -j monitors all 2>/dev/null | jq -r '.[] | select(.name | startswith("RDP-")) | .name'); do
+		hyprctl output remove "$o" >/dev/null
+	done
+	# No reload (it would undo the plan): restore key repeat on other virtual keyboards.
+	for k in $(hyprctl -j devices 2>/dev/null | jq -r '.keyboards[].name | select(startswith("hl-virtual-keyboard"))'); do
+		case $k in *[!A-Za-z0-9_.-]*) continue ;; esac
+		hyprctl eval "hl.device({ name = \"$k\", repeat_rate = $rate, repeat_delay = $delay })" >/dev/null 2>&1
+	done
+else
+	for o in $outputs; do hyprctl output remove "$o" >/dev/null; done
+	hyprctl reload >/dev/null
+fi
+rm -f "$plan"
+hyprctl eval 'hl.dispatch(hl.dsp.dpms({ action = "on" }))' >/dev/null
+exit 0

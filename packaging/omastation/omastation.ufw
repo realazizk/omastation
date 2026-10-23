@@ -1,0 +1,4 @@
+[omastation]
+title=omastation RDP server
+description=Remote Desktop (RDP) into the Hyprland session
+ports=3389/tcp|3389/udp

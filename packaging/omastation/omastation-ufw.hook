@@ -1,0 +1,11 @@
+# Existing ufw rules for the profile keep their old ports until `ufw app update`.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Path
+Target = etc/ufw/applications.d/omastation
+
+[Action]
+Description = Updating the firewall rules of omastation's ufw profile...
+When = PostTransaction
+Exec = /bin/sh -c 'command -v ufw >/dev/null 2>&1 || exit 0; ufw app update omastation >/dev/null'

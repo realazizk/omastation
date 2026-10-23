@@ -1,0 +1,155 @@
+diff --git i/src/managers/screenshare/CursorshareSession.cpp w/src/managers/screenshare/CursorshareSession.cpp
+index 5c2ce67..1bd57ca 100644
+--- i/src/managers/screenshare/CursorshareSession.cpp
++++ w/src/managers/screenshare/CursorshareSession.cpp
+@@ -6,6 +6,7 @@
+ #include "../../render/pass/ClearPassElement.hpp"
+ #include "../../render/pass/TexPassElement.hpp"
+ #include <hyprgraphics/egl/Egl.hpp>
++#include <cstring>
+ 
+ using namespace Hyprgraphics::Egl;
+ using namespace Screenshare;
+@@ -17,6 +18,17 @@
+         m_events.constraintsChanged.emit();
+ 
+         if (m_pendingFrame.pending) {
++            // the frame's buffer fits the constraints it was attached under:
++            // an image of another size would be cropped or padded into it.
++            // Fail it; the client captures again with a buffer of the new
++            // size, copied at once (the constraints changed).
++            if (!m_pendingFrame.buffer || m_pendingFrame.buffer->size != m_bufferSize) {
++                if (m_pendingFrame.callback)
++                    m_pendingFrame.callback(RESULT_NOT_COPIED);
++                m_pendingFrame.pending = false;
++                return;
++            }
++
+             if (copy())
+                 return;
+ 
+@@ -47,15 +59,23 @@
+     m_constraintsChanged    = true;
+ 
+     // cursor is hidden, keep the previous constraints and render 0 alpha
+-    if (!cursorImage.pBuffer)
++    if (!cursorImage.pBuffer && !cursorImage.surface)
+         return;
+ 
+-    // TODO: should cursor share have a format bit flip for RGBA?
+-    if (auto attrs = cursorImage.pBuffer->shm(); attrs.success) {
+-        m_format = attrs.format;
++    if (cursorImage.pBuffer) {
++        // TODO: should cursor share have a format bit flip for RGBA?
++        if (auto attrs = cursorImage.pBuffer->shm(); attrs.success) {
++            m_format = attrs.format;
++        } else {
++            // we only have shm cursors
++            return;
++        }
+     } else {
+-        // we only have shm cursors
+-        return;
++        // a client's cursor surface: its texture is rendered into the share
++        // buffer, so offer the format a cursor needs
++        if (cursorImage.size.x <= 0 || cursorImage.size.y <= 0)
++            return;
++        m_format = DRM_FORMAT_ARGB8888;
+     }
+ 
+     m_hotspot    = cursorImage.hotspot;
+@@ -113,11 +133,13 @@
+ }
+ 
+ void CCursorshareSession::render() {
+-    const auto  PERM = g_pDynamicPermissionManager->clientPermissionMode(m_client, PERMISSION_TYPE_CURSOR_POS);
+-
+-    const auto& cursorImage = Pointer::mgr()->currentCursorImage();
++    const auto PERM = g_pDynamicPermissionManager->clientPermissionMode(m_client, PERMISSION_TYPE_CURSOR_POS);
+ 
+     // TODO: implement a monitor independent render mode to buffer that does this in CHyprRenderer::begin() or something like that
++    // project into the cursor buffer itself (as window share does): with the
++    // monitor's projection a cursor-sized box covers a fraction of a pixel
++    g_pHyprRenderer->m_renderData.fbSize = m_bufferSize;
++    g_pHyprRenderer->setProjectionType(Render::RPT_EXPORT);
+     g_pHyprRenderer->m_renderData.transformDamage = false;
+     g_pHyprRenderer->setViewport(0, 0, m_bufferSize.x, m_bufferSize.y);
+ 
+@@ -126,20 +148,57 @@
+     if (PERM != PERMISSION_RULE_ALLOW_MODE_ALLOW || !overlaps) {
+         // render black when not allowed
+         g_pHyprRenderer->draw(CClearPassElement::SClearData{Colors::BLACK});
+-    } else if (!cursorImage.pBuffer || !cursorImage.surface || !cursorImage.bufferTex) {
++    } else if (const auto TEX = Pointer::mgr()->getCurrentCursorTexture(); !TEX) {
+         // render clear when cursor is probably hidden
+         g_pHyprRenderer->draw(CClearPassElement::SClearData{{0, 0, 0, 0}});
+     } else {
+-        // render cursor
+-        g_pHyprRenderer->draw(CTexPassElement::SRenderData{
+-            .tex = cursorImage.bufferTex,
+-            .box = {{}, cursorImage.bufferTex->m_size},
+-        });
++        // render cursor: a theme buffer or a client's cursor surface (the
++        // image holds one or the other, never both), over transparent (the
++        // buffer holds an older image or nothing defined yet). A texture is
++        // drawn only inside the damage passed with it: none draws nothing.
++        const CBox BUFFER = {{}, m_bufferSize};
++        g_pHyprRenderer->draw(CClearPassElement::SClearData{{0, 0, 0, 0}});
++        g_pHyprRenderer->draw(
++            CTexPassElement::SRenderData{
++                .tex = TEX,
++                .box = {{}, TEX->m_size},
++            },
++            CRegion{BUFFER});
+     }
+ 
+     g_pHyprRenderer->m_renderData.blockScreenShader = true;
+ }
+ 
++// A theme cursor (hyprcursor/xcursor) is CPU memory, usually in exactly the
++// share buffer's format and size: copy it straight into a shm share buffer.
++// Returns false when the cursor has to be rendered instead (client cursor
++// surfaces, dmabuf buffers, permission or position decide otherwise).
++static bool copyThemeCursorToShm(SP<IHLBuffer> buffer, wl_client* client, const FSourceBoxCallback& sourceBox) {
++    const auto& cursorImage = Pointer::mgr()->currentCursorImage();
++    if (!cursorImage.pBuffer)
++        return false;
++
++    if (g_pDynamicPermissionManager->clientPermissionMode(client, PERMISSION_TYPE_CURSOR_POS) != PERMISSION_RULE_ALLOW_MODE_ALLOW ||
++        !Pointer::mgr()->getCursorBoxGlobal().overlaps(sourceBox()))
++        return false;
++
++    const auto SRC = cursorImage.pBuffer->shm();
++    const auto DST = buffer->shm();
++    if (!SRC.success || !DST.success || SRC.format != DRM_FORMAT_ARGB8888 || DST.format != SRC.format || SRC.size != DST.size)
++        return false;
++
++    auto [srcData, srcFormat, srcLen] = cursorImage.pBuffer->beginDataPtr(0);
++    auto [dstData, dstFormat, dstLen] = buffer->beginDataPtr(0);
++    if (srcData && dstData) {
++        const size_t ROW = sc<size_t>(SRC.size.x) * 4;
++        for (int y = 0; y < SRC.size.y; ++y)
++            std::memcpy(dstData + sc<size_t>(y) * DST.stride, srcData + sc<size_t>(y) * SRC.stride, ROW);
++    }
++    cursorImage.pBuffer->endDataPtr();
++    buffer->endDataPtr();
++    return srcData && dstData;
++}
++
+ bool CCursorshareSession::copy() {
+     if (!m_pendingFrame.callback || !m_pendingFrame.monitor || !m_pendingFrame.callback || !m_pendingFrame.sourceBoxCallback)
+         return false;
+@@ -166,6 +225,13 @@
+                 callback(RESULT_COPIED);
+         });
+     } else if (auto attrs = m_pendingFrame.buffer->shm(); attrs.success) {
++        if (copyThemeCursorToShm(m_pendingFrame.buffer, m_client, m_pendingFrame.sourceBoxCallback)) {
++            m_pendingFrame.callback(RESULT_COPIED);
++            m_pendingFrame.pending = false;
++            m_constraintsChanged   = false;
++            return true;
++        }
++
+         const auto PFORMAT = getPixelFormatFromDRM(m_format);
+ 
+         if (attrs.format != m_format || !PFORMAT) {

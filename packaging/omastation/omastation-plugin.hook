@@ -1,0 +1,11 @@
+# The plugin is built for one Hyprland build: rebuild it on every Hyprland install.
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = hyprland
+
+[Action]
+Description = Building omastation's Hyprland plugin for the installed Hyprland...
+When = PostTransaction
+Exec = /usr/lib/omastation/omastation-plugin-build
