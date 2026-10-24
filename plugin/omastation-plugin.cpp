@@ -3,7 +3,8 @@
 //    of its RDP outputs, and stay hidden in every other capture;
 // 2. absolute pointer motion moves the hardware cursor;
 // 3. RDP outputs' own frames leave out the software cursor (the client draws it);
-// 4. `hyprctl omastation-cursor` reports the cursor image's scale, hotspot and visibility.
+// 4. `hyprctl omastation-cursor` reports the cursor image's scale, hotspot and visibility;
+// 5. capturing a window whose monitor is gone fails instead of crashing Hyprland.
 // It only loads into the Hyprland build it was compiled for; a hook that cannot
 // be installed is skipped.
 
@@ -22,12 +23,14 @@
 #include <hyprland/src/helpers/MiscFunctions.hpp>
 #include <hyprland/src/debug/log/Logger.hpp>
 
+#include <cxxabi.h>
 #include <elf.h>
 #include <link.h>
 #include <sys/stat.h>
 
 #include <algorithm>
 #include <filesystem>
+#include <cstdlib>
 #include <cstring>
 #include <format>
 #include <string>
@@ -64,11 +67,15 @@ struct SMonitorStates {
 struct SOnCursorMoved {
     friend constexpr auto privateMember(SOnCursorMoved);
 };
+struct SManagedSessions {
+    friend constexpr auto privateMember(SManagedSessions);
+};
 
 template struct SPrivate<SFrameSession, &Screenshare::CScreenshareFrame::m_session>;
 template struct SPrivate<SSessionClient, &Screenshare::CScreenshareSession::m_client>;
 template struct SPrivate<SMonitorStates, &Pointer::CPointerManager::m_monitorStates>;
 template struct SPrivate<SOnCursorMoved, &Pointer::CPointerManager::onCursorMoved>;
+template struct SPrivate<SManagedSessions, &Screenshare::CScreenshareManager::m_managedSessions>;
 
 // ---- protected windows ----
 
@@ -248,6 +255,44 @@ namespace SoftwareCursor {
     }
 }
 
+// ---- capturing a window whose monitor is gone ----
+// A window can still point at a monitor that is gone: an RDP output removed, or a
+// monitor unplugged, while it was on it. Hyprland's capture session reads that
+// monitor and crashes (a live window preview after an RDP session ended): the
+// session is stopped instead, and the capture fails.
+
+namespace GoneMonitor {
+
+    static CFunctionHook* g_init       = nullptr;
+    static CFunctionHook* g_getSession = nullptr;
+
+    using FInit       = void (*)(void*);
+    using FGetSession = WP<Screenshare::CScreenshareSession> (*)(void*, wl_client*, PHLWINDOW);
+
+    static void hkInit(void* thisptr) {
+        auto* const SESSION = sc<Screenshare::CScreenshareSession*>(thisptr);
+        bool        gone    = false;
+        try {
+            gone = !SESSION->monitor();
+        } catch (...) {}
+        if (!gone)
+            return rc<FInit>(g_init->m_original)(thisptr);
+        Log::logger->log(Log::ERR, "[omastation] a client asked to capture a window whose monitor is gone: capture stopped");
+        SESSION->stop();
+    }
+
+    // A session stopped while it was created did so before Hyprland listened for its
+    // stop: it would be handed out for every later capture of that window. Stopped
+    // sessions go first.
+    static WP<Screenshare::CScreenshareSession> hkGetSession(void* thisptr, wl_client* client, PHLWINDOW window) {
+        try {
+            auto& managed = sc<Screenshare::CScreenshareManager*>(thisptr)->*privateMember(SManagedSessions{});
+            std::erase_if(managed, [](const auto& s) { return !s || !s->m_session || !s->m_session->isActive(); });
+        } catch (...) {}
+        return rc<FGetSession>(g_getSession->m_original)(thisptr, client, window);
+    }
+}
+
 // In the plugin description; omastation checks for it in `hyprctl plugin list`.
 static constexpr const char* RDP_CURSOR_MARKER = "[rdp-frames-without-cursor]";
 
@@ -345,7 +390,18 @@ static std::string runningBuildId() {
     return id;
 }
 
+static std::string demangle(const std::string& mangled) {
+    int         status = 0;
+    char*       out    = abi::__cxa_demangle(mangled.c_str(), nullptr, nullptr, &status);
+    std::string result = status == 0 && out ? out : "";
+    std::free(out);
+    return result;
+}
+
 // Hooks the function with exactly this demangled name, or logs and returns null.
+// The name is checked against the match's own symbol: Hyprland's demangled names
+// shift past a symbol it cannot resolve (inotify_init1@GLIBC_2.9 for "init"), and
+// would name another match's function.
 static CFunctionHook* hookOrSkip(const std::string& demangled, const void* destination, std::string_view feature) {
     const auto                  NAME = demangled.substr(0, demangled.find('('));
     const auto                  BARE = NAME.substr(NAME.rfind(':') + 1);
@@ -357,7 +413,7 @@ static CFunctionHook* hookOrSkip(const std::string& demangled, const void* desti
         return nullptr;
     }
     for (const auto& m : matches) {
-        if (m.demangled != demangled)
+        if (demangle(m.signature) != demangled)
             continue;
         auto* hook = HyprlandAPI::createFunctionHook(g_handle, m.address, destination);
         if (hook && hook->hook())
@@ -400,8 +456,13 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
                                           "std::chrono::time_point<std::chrono::_V2::steady_clock, std::chrono::duration<long, std::ratio<1l, 1000000000l> > > const&, "
                                           "Hyprutils::Math::CRegion&, std::optional<Hyprutils::Math::Vector2D>, bool, bool)",
                                           rc<const void*>(&SoftwareCursor::hkRenderSoftwareCursorsFor), "RDP outputs' frames without the cursor (client-drawn pointers)");
+    GoneMonitor::g_init = hookOrSkip("Screenshare::CScreenshareSession::init()", rc<const void*>(&GoneMonitor::hkInit), "the fix for capturing a window whose monitor is gone");
+    // Only needed with the fix: it drops the sessions the fix stops.
+    if (GoneMonitor::g_init)
+        GoneMonitor::g_getSession = hookOrSkip("Screenshare::CScreenshareManager::getManagedSession(wl_client*, Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>)",
+                                               rc<const void*>(&GoneMonitor::hkGetSession), "capturing again a window whose monitor came back");
 
-    if (!Protected::g_render && !Protected::g_storeTempFB && !Cursor::g_warpAbsolute && !SoftwareCursor::g_render)
+    if (!Protected::g_render && !Protected::g_storeTempFB && !Cursor::g_warpAbsolute && !SoftwareCursor::g_render && !GoneMonitor::g_init)
         throw std::runtime_error("omastation plugin: none of its hooks could be installed");
 
     try {
@@ -410,8 +471,11 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!CursorInfo::g_command)
         Log::logger->log(Log::ERR, "[omastation] cannot register `hyprctl omastation-cursor`: RDP pointer hotspots are estimated");
 
-    Log::logger->log(Log::INFO, "[omastation] loaded for Hyprland build {}: protected windows {}, absolute motion cursor fix {}, RDP frames without the cursor {}", RUNNING,
-                     Protected::g_render ? "on" : "off", Cursor::g_warpAbsolute ? "on" : "off", SoftwareCursor::g_render ? "on" : "off");
+    Log::logger->log(Log::INFO,
+                     "[omastation] loaded for Hyprland build {}: protected windows {}, absolute motion cursor fix {}, RDP frames without the cursor {}, "
+                     "capturing windows of a gone monitor fix {}",
+                     RUNNING, Protected::g_render ? "on" : "off", Cursor::g_warpAbsolute ? "on" : "off", SoftwareCursor::g_render ? "on" : "off",
+                     GoneMonitor::g_init ? "on" : "off");
     std::string description = "protected windows for omastation's capture of its outputs; absolute motion moves the hardware cursor";
     if (SoftwareCursor::g_render)
         description += std::string{"; RDP outputs' frames without the cursor "} + RDP_CURSOR_MARKER;
