@@ -59,6 +59,8 @@ pub const Options = struct {
     lossy_motion: LossyMotion = .auto,
     /// Highest bulk compression type (MS-RDPBCGR 3.1.8), capped by the client's; null: none.
     bulk: ?bulk_codec.Type = .xcrush,
+    /// DRM render node for H.264 (`--gpu`); null: the first whose driver encodes H.264.
+    vaapi_device: ?[:0]const u8 = null,
 
     /// Deterministic pipelines for tests that model planar frames.
     pub const planar_avc420: Options = .{ .avc444 = false, .progressive = false, .remotefx = false, .nscodec = false, .clearcodec = false };
@@ -76,7 +78,7 @@ pub const Options = struct {
         while (it.next()) |name| {
             if (std.mem.eql(u8, name, "all")) {
                 const keep = o.*;
-                o.* = .{ .lossy_motion = keep.lossy_motion, .bulk = keep.bulk, .rdpgfx = keep.rdpgfx };
+                o.* = .{ .lossy_motion = keep.lossy_motion, .bulk = keep.bulk, .rdpgfx = keep.rdpgfx, .vaapi_device = keep.vaapi_device };
             } else if (std.mem.eql(u8, name, "none") or std.mem.eql(u8, name, "planar")) {} else if (std.mem.eql(u8, name, "avc444")) {
                 o.avc444 = true;
                 o.avc444_preferred = true;

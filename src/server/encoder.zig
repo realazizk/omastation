@@ -5,6 +5,7 @@ const std = @import("std");
 const bytes = @import("../core/bytes.zig");
 const gfx = @import("../proto/gfx.zig");
 const planar = @import("../codec/planar.zig");
+const workers = @import("../codec/workers.zig");
 
 pub const tile: u32 = 64;
 
@@ -29,12 +30,22 @@ pub const Encoder = struct {
     changed_ms: []i64 = &.{},
     /// Per lossy tile, the H.264 QP shown there, or `lossy_other`.
     lossy_qp: []u8 = &.{},
+    /// `writePlanar` scratch: one bitmap per rect.
+    bufs: BufPool = .{},
+    /// `diff` scratch: per tile row, the runs found there (at most `runsPerRow`) and their count.
+    row_runs: []Run = &.{},
+    row_n: []u32 = &.{},
+
+    const Run = struct { rect: gfx.Rect16, tight: gfx.Rect16 };
 
     pub fn init(gpa: std.mem.Allocator) Encoder {
         return .{ .gpa = gpa };
     }
 
     pub fn deinit(e: *Encoder) void {
+        e.bufs.deinit(e.gpa);
+        e.gpa.free(e.row_runs);
+        e.gpa.free(e.row_n);
         e.gpa.free(e.changed_ms);
         e.gpa.free(e.lossy_qp);
         e.owed.deinit(e.gpa);
@@ -55,6 +66,10 @@ pub const Encoder = struct {
             errdefer e.gpa.free(changed);
             const qps = try e.gpa.alloc(u8, tiles);
             errdefer e.gpa.free(qps);
+            const runs = try e.gpa.alloc(Run, runsPerRow(w) * tilesFor(h));
+            errdefer e.gpa.free(runs);
+            const row_n = try e.gpa.alloc(u32, tilesFor(h));
+            errdefer e.gpa.free(row_n);
             // Grow `owed` first: if `lossy` then fails, `owed` is merely oversized.
             if (tiles > e.owed.bit_length) try e.owed.resize(e.gpa, tiles, false);
             try e.lossy.resize(e.gpa, tiles, false);
@@ -63,6 +78,10 @@ pub const Encoder = struct {
             e.changed_ms = changed;
             e.gpa.free(e.lossy_qp);
             e.lossy_qp = qps;
+            e.gpa.free(e.row_runs);
+            e.row_runs = runs;
+            e.gpa.free(e.row_n);
+            e.row_n = row_n;
             e.gpa.free(e.shadow);
             e.shadow = shadow;
             e.width = w;
@@ -77,6 +96,11 @@ pub const Encoder = struct {
 
     fn tilesFor(px: u32) u32 {
         return (px + tile - 1) / tile;
+    }
+
+    /// Runs of changed tiles a row can hold: every other tile.
+    fn runsPerRow(w: u32) usize {
+        return (tilesFor(w) + 1) / 2;
     }
 
     fn tilesX(e: *const Encoder) u32 {
@@ -365,36 +389,60 @@ pub const Encoder = struct {
     pub fn diff(e: *Encoder, pixels: []const u8, stride: usize) !usize {
         e.rects.clearRetainingCapacity();
         e.tight.clearRetainingCapacity();
-        const tiles_x = (e.width + tile - 1) / tile;
-        var ty: u32 = 0;
-        while (ty * tile < e.height) : (ty += 1) {
-            const y0 = ty * tile;
-            const th = @min(tile, e.height - y0);
-            var run_start: ?u32 = null;
-            var run_box: gfx.Rect16 = undefined;
-            var tx: u32 = 0;
-            while (tx <= tiles_x) : (tx += 1) {
-                const box: ?gfx.Rect16 = if (tx == tiles_x) null else if (!e.valid) tileRect(e, tx, y0, th) else e.changedBox(pixels, stride, tx * tile, y0, th);
-                if (box) |b| {
-                    run_box = if (run_start == null) b else union16(run_box, b);
-                    if (run_start == null) run_start = tx;
-                    continue;
-                }
-                const start = run_start orelse continue;
-                run_start = null;
-                const x0 = start * tile;
-                const x1 = @min(tx * tile, e.width);
-                try e.rects.ensureUnusedCapacity(e.gpa, 1);
-                try e.tight.append(e.gpa, run_box);
-                e.rects.appendAssumeCapacity(.{ .left = @intCast(x0), .top = @intCast(y0), .right = @intCast(x1), .bottom = @intCast(y0 + th) });
+        const tiles_y = tilesFor(e.height);
+        const per = runsPerRow(e.width);
+        // Room for every run first: once the rows have run, the shadow holds the frame.
+        try e.rects.ensureTotalCapacity(e.gpa, per * tiles_y);
+        try e.tight.ensureTotalCapacity(e.gpa, per * tiles_y);
+        // Tile rows are compared (and copied into the shadow) in parallel: a row only touches
+        // its own pixels, and its runs land in its own slots, so the result is in row order.
+        const Job = struct {
+            e: *Encoder,
+            pixels: []const u8,
+            stride: usize,
+            per: usize,
+
+            fn run(j: @This(), _: usize, ty: usize) void {
+                j.e.diffRow(j.pixels, j.stride, @intCast(ty), j.e.row_runs[ty * j.per ..][0..j.per], &j.e.row_n[ty]);
             }
-        }
-        // Regions do not overlap, so copying after all comparisons is safe.
-        for (e.rects.items) |r| e.copyToShadow(pixels, stride, r.left, r.top, r.right - r.left, r.bottom - r.top);
+        };
+        workers.forEach(tiles_y, Job{ .e = e, .pixels = pixels, .stride = stride, .per = per }, Job.run);
+        for (0..tiles_y) |ty| for (e.row_runs[ty * per ..][0..e.row_n[ty]]) |r| {
+            e.rects.appendAssumeCapacity(r.rect);
+            e.tight.appendAssumeCapacity(r.tight);
+        };
         // A whole frame covers whatever was owed.
         if (!e.valid) e.owed.unsetAll();
         e.valid = true;
         return e.rects.items.len;
+    }
+
+    /// Row `ty`'s runs of changed tiles into `runs`, their count into `n`, their pixels into the shadow.
+    fn diffRow(e: *Encoder, pixels: []const u8, stride: usize, ty: u32, runs: []Run, n: *u32) void {
+        const tiles_x = tilesFor(e.width);
+        const y0 = ty * tile;
+        const th = @min(tile, e.height - y0);
+        var count: u32 = 0;
+        var run_start: ?u32 = null;
+        var run_box: gfx.Rect16 = undefined;
+        var tx: u32 = 0;
+        while (tx <= tiles_x) : (tx += 1) {
+            const box: ?gfx.Rect16 = if (tx == tiles_x) null else if (!e.valid) tileRect(e, tx, y0, th) else e.changedBox(pixels, stride, tx * tile, y0, th);
+            if (box) |b| {
+                run_box = if (run_start == null) b else union16(run_box, b);
+                if (run_start == null) run_start = tx;
+                continue;
+            }
+            const start = run_start orelse continue;
+            run_start = null;
+            const x0 = start * tile;
+            const x1 = @min(tx * tile, e.width);
+            runs[count] = .{ .rect = .{ .left = @intCast(x0), .top = @intCast(y0), .right = @intCast(x1), .bottom = @intCast(y0 + th) }, .tight = run_box };
+            count += 1;
+        }
+        // Runs do not overlap, so copying after the row's comparisons is safe.
+        for (runs[0..count]) |r| e.copyToShadow(pixels, stride, r.rect.left, r.rect.top, r.rect.right - r.rect.left, r.rect.bottom - r.rect.top);
+        n.* = count;
     }
 
     /// `diff`, then planar WireToSurface1 PDUs for the changed regions.
@@ -418,16 +466,50 @@ pub const Encoder = struct {
     }
 
     pub fn writePlanar(e: *Encoder, w: *bytes.Writer, surface_id: u16) !void {
-        for (e.rects.items) |r| try e.writePlanarRect(w, surface_id, r);
+        try e.bufs.ensure(e.gpa, e.rects.items.len);
+        try e.encodePlanarRects(e.rects.items, e.bufs.items);
+        for (e.rects.items, e.bufs.items[0..e.rects.items.len]) |r, *b| try writePlanarPayload(w, surface_id, r, b.items);
     }
 
     pub fn writePlanarRect(e: *Encoder, w: *bytes.Writer, surface_id: u16, r: gfx.Rect16) !void {
-        const sstride = @as(usize, e.width) * 4;
         e.bitmap.clearRetainingCapacity();
+        try e.encodePlanarRect(&e.bitmap, r);
+        try writePlanarPayload(w, surface_id, r, e.bitmap.items);
+    }
+
+    /// The planar bitmap of `r` from the shadow, appended to `out`.
+    pub fn encodePlanarRect(e: *const Encoder, out: *std.ArrayList(u8), r: gfx.Rect16) planar.EncodeError!void {
+        const sstride = @as(usize, e.width) * 4;
         const first = e.shadow[@as(usize, r.top) * sstride + @as(usize, r.left) * 4 ..];
-        try planar.encodePlanar(e.gpa, &e.bitmap, first, sstride, r.right - r.left, r.bottom - r.top);
-        const p = try gfx.beginWireToSurface1(w, surface_id, .planar, r, e.bitmap.items.len);
-        try w.bytes(e.bitmap.items);
+        try planar.encodePlanar(e.gpa, out, first, sstride, r.right - r.left, r.bottom - r.top);
+    }
+
+    /// `encodePlanarRect` of every rect into its buffer (cleared first), in parallel.
+    pub fn encodePlanarRects(e: *const Encoder, rects: []const gfx.Rect16, bufs: []std.ArrayList(u8)) planar.EncodeError!void {
+        std.debug.assert(bufs.len >= rects.len);
+        var errs: [workers.max_tasks_cap]?planar.EncodeError = @splat(null);
+        const Job = struct {
+            e: *const Encoder,
+            rects: []const gfx.Rect16,
+            bufs: []std.ArrayList(u8),
+            errs: []?planar.EncodeError,
+
+            fn run(j: @This(), task: usize, i: usize) void {
+                if (j.errs[task] != null) return;
+                j.bufs[i].clearRetainingCapacity();
+                j.e.encodePlanarRect(&j.bufs[i], j.rects[i]) catch |err| {
+                    j.errs[task] = err;
+                };
+            }
+        };
+        workers.forEach(rects.len, Job{ .e = e, .rects = rects, .bufs = bufs, .errs = &errs }, Job.run);
+        for (errs) |m| if (m) |err| return err;
+    }
+
+    /// WIRE_TO_SURFACE_1 carrying a planar bitmap of `r`.
+    pub fn writePlanarPayload(w: *bytes.Writer, surface_id: u16, r: gfx.Rect16, payload: []const u8) !void {
+        const p = try gfx.beginWireToSurface1(w, surface_id, .planar, r, payload.len);
+        try w.bytes(payload);
         p.finish(w);
     }
 
@@ -485,6 +567,27 @@ pub const Encoder = struct {
     }
 };
 
+/// Reusable output buffers, one per item coded in parallel.
+pub const BufPool = struct {
+    items: []std.ArrayList(u8) = &.{},
+
+    /// At least `n` buffers, the existing ones kept.
+    pub fn ensure(p: *BufPool, gpa: std.mem.Allocator, n: usize) !void {
+        if (p.items.len >= n) return;
+        const grown = try gpa.alloc(std.ArrayList(u8), n);
+        @memcpy(grown[0..p.items.len], p.items);
+        @memset(grown[p.items.len..], .empty);
+        gpa.free(p.items);
+        p.items = grown;
+    }
+
+    pub fn deinit(p: *BufPool, gpa: std.mem.Allocator) void {
+        for (p.items) |*b| b.deinit(gpa);
+        gpa.free(p.items);
+        p.* = .{};
+    }
+};
+
 fn union16(a: gfx.Rect16, b: gfx.Rect16) gfx.Rect16 {
     return .{ .left = @min(a.left, b.left), .top = @min(a.top, b.top), .right = @max(a.right, b.right), .bottom = @max(a.bottom, b.bottom) };
 }
@@ -496,6 +599,40 @@ fn testFrame(gpa: std.mem.Allocator, w: u32, h: u32, stride: usize) ![]u8 {
         p.* = .{ @truncate(x * 7), @truncate(y * 3), @truncate(x ^ y), 0 };
     };
     return px;
+}
+
+test "diff on many tasks lists the same runs as on one" {
+    const gpa = std.testing.allocator;
+    const w: u32 = 700;
+    const h: u32 = 300;
+    const px = try testFrame(gpa, w, h, w * 4);
+    defer gpa.free(px);
+    const saved = workers.maxTasks();
+    defer workers.setMaxTasks(saved);
+    var lists: [2]std.ArrayList(gfx.Rect16) = .{ .empty, .empty };
+    defer for (&lists) |*l| l.deinit(gpa);
+    for ([_]usize{ 1, 6 }, &lists) |tasks, *list| {
+        workers.setMaxTasks(tasks);
+        var e = Encoder.init(gpa);
+        defer e.deinit();
+        try e.reset(w, h);
+        for (0..6) |frame| {
+            // frame 0: whole; then scattered changes, a still frame, and a wide one
+            for (0..40) |k| {
+                const i = ((k * 7919 + frame * 104729) % (w * h)) * 4;
+                if (frame % 3 != 2) px[i] +%= @intCast(frame + 1);
+            }
+            if (frame == 5) for (px[50 * w * 4 ..][0 .. 3 * w * 4]) |*b| {
+                b.* ^= 0x55;
+            };
+            _ = try e.diff(px, w * 4);
+            try list.appendSlice(gpa, e.rects.items);
+            try list.appendSlice(gpa, e.tight.items);
+            try list.append(gpa, .{ .left = 0, .top = 0, .right = 0, .bottom = 0 });
+        }
+    }
+    try std.testing.expect(lists[0].items.len > 20);
+    try std.testing.expectEqualSlices(gfx.Rect16, lists[0].items, lists[1].items);
 }
 
 test "first frame is sent whole, then only changed tiles" {

@@ -229,6 +229,8 @@ pub fn sendGfx(c: *Conn, msg: []const u8) conn_mod.Error!usize {
     defer seg.deinit(c.gpa);
     var w = bytes.Writer.init(&seg, c.gpa);
     if (c.ch.zgfx) |*z| {
+        // On a slow link every byte counts; elsewhere segments that barely shrink go raw early.
+        z.opts.bail_gain_x16 = if (c.ch.adapt.slow()) 0 else zgfx_bail_gain_x16;
         try z.writeSegmented(&w, msg);
     } else {
         try gfx.writeSegmented(&w, msg);
@@ -243,6 +245,8 @@ pub fn sendGfx(c: *Conn, msg: []const u8) conn_mod.Error!usize {
 }
 
 const zgfx_ratio_min_bytes = 16 * 1024;
+/// ZGFX gives a segment up when it saves under 2/16 (zgfx.Options.bail_gain_x16).
+const zgfx_bail_gain_x16: u8 = 2;
 
 fn setSingleMonitor(c: *Conn) void {
     c.ch.monitors[0] = .{ .left = 0, .top = 0, .right = @as(i32, c.width) - 1, .bottom = @as(i32, c.height) - 1, .primary = true };

@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const c = @import("c");
 const omastation = @import("omastation");
 
@@ -98,6 +99,10 @@ const usage =
     \\                         bitmaps only). AVC444 goes to clients that ask for
     \\                         it (as Windows); naming avc444 or h264 offers it to
     \\                         every client that takes AVC
+    \\  --gpu NODE             DRM render node whose VA-API driver encodes H.264, e.g.
+    \\                         /dev/dri/renderD129 or just renderD129 (default: the
+    \\                         first node that can; on a hybrid laptop with an NVIDIA
+    \\                         dGPU that is usually the iGPU)
     \\  --no-gfx               do not offer the graphics pipeline (RDPGFX): bitmap
     \\                         updates and surface commands only (testing)
     \\  --lossy-motion MODE    CPU lossy codecs (progressive, RemoteFX, NSCodec) for
@@ -183,7 +188,9 @@ const Options = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    const gpa = init.gpa;
+    // ReleaseSafe's process allocator is the leak-checking SafeAllocator, which never reuses
+    // memory and checks every call; a server encoding frames all day wants libc's.
+    const gpa = if (builtin.mode == .debug) init.gpa else std.heap.c_allocator;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
@@ -481,6 +488,10 @@ fn parseOptions(arena: std.mem.Allocator, args: []const [:0]const u8, first: usi
         } else if (std.mem.eql(u8, a, "--codecs")) {
             o.features.graphics.parseCodecs(val) catch return fail("bad --codecs");
             i += 1;
+        } else if (std.mem.eql(u8, a, "--gpu")) {
+            if (val.len == 0) return fail("bad --gpu");
+            o.features.graphics.vaapi_device = if (std.mem.startsWith(u8, val, "/")) val else try std.fmt.allocPrintSentinel(arena, "/dev/dri/{s}", .{val}, 0);
+            i += 1;
         } else if (std.mem.eql(u8, a, "--no-gfx")) {
             o.features.graphics.rdpgfx = false;
         } else if (std.mem.eql(u8, a, "--lossy-motion")) {
@@ -716,6 +727,17 @@ test "--udp-version takes its value: 3 selects RDP-UDP2 and the options after it
     try std.testing.expectEqual(@as(u16, 3390), o.port);
 }
 
+test "--gpu takes a render node path or its name under /dev/dri, and --codecs all keeps it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var o = Options{};
+    try std.testing.expectEqual(Parsed.run, try parseOptions(arena_state.allocator(), &.{ "omastation", "--gpu", "renderD129", "--codecs", "all" }, 1, &o));
+    try std.testing.expectEqualStrings("/dev/dri/renderD129", o.features.graphics.vaapi_device.?);
+    try std.testing.expectEqual(Parsed.run, try parseOptions(arena_state.allocator(), &.{ "omastation", "--gpu", "/dev/dri/renderD128" }, 1, &o));
+    try std.testing.expectEqualStrings("/dev/dri/renderD128", o.features.graphics.vaapi_device.?);
+    try std.testing.expect(o.features.graphics.avc420);
+}
+
 test "every option the usage text shows with a value consumes it" {
     // An option in the usage text without a sample here fails the test.
     const samples = [_]struct { []const u8, [:0]const u8 }{
@@ -728,7 +750,7 @@ test "every option the usage text shows with a value consumes it" {
         .{ "--audio-quality", "dynamic" },  .{ "--audio-max-bandwidth", "22201" }, .{ "--remoteapp-launcher", "a --" },
         .{ "--udp-version", "3" },          .{ "--mic-buffer-max", "300" },        .{ "--touch", "auto" },
         .{ "--log-level", "info" },         .{ "--flight-record", "off" },         .{ "--test-video", "640x360" },
-        .{ "--test-scene", "scroll_busy" }, .{ "--cursor", "auto" },
+        .{ "--test-scene", "scroll_busy" }, .{ "--cursor", "auto" },               .{ "--gpu", "renderD129" },
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

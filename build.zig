@@ -51,13 +51,28 @@ pub fn build(b: *std.Build) void {
     run_cmd.addPassthruArgs();
     b.step("run", "Run the server").dependOn(&run_cmd.step);
 
+    // `zig build bench -- --size 3840x2160`: CPU codec timings (src/bench.zig).
+    const bench = b.addExecutable(.{
+        .name = "omastation-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/bench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{.{ .name = "c", .module = c_mod }},
+        }),
+    });
+    for (system_libs) |l| bench.root_module.linkSystemLibrary(l, .{});
+    const run_bench = b.addRunArtifact(bench);
+    run_bench.addPassthruArgs();
+    b.step("bench", "Time the CPU codecs (RemoteFX, progressive) on synthetic frames").dependOn(&run_bench.step);
+
     const test_filters = b.option([]const []const u8, "test-filter", "unit tests: only those whose name contains this") orelse &.{};
     const lib_tests = b.addTest(.{ .root_module = lib_mod, .filters = test_filters });
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(lib_tests).step);
     const exe_tests = b.addTest(.{ .name = "main", .root_module = exe.root_module });
     test_step.dependOn(&b.addRunArtifact(exe_tests).step);
-
 }
 
 const wl_protocol_xmls = [_][]const u8{
