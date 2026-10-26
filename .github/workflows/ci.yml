@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: zig build test (Arch Linux)
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    steps:
+      - name: Install zig and the libraries the server links
+        run: pacman -Syu --noconfirm --needed git zig pkgconf openssl pam libva libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
+
+      - uses: actions/checkout@v4
+
+      - name: Formatting
+        run: zig fmt --check build.zig src
+
+      - name: Build (ReleaseSafe, as packaged)
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Unit tests
+        run: zig build test --summary all
+
+      - name: Benchmark builds and runs
+        run: zig build bench -Doptimize=ReleaseSafe -- --size 640x360 --reps 1 --only kernels,lossless
