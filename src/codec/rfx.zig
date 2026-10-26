@@ -3,8 +3,11 @@
 //! RDPGFX WIRE_TO_SURFACE_PDU_1 with codecId CAVIDEO (MS-RDPEGFX 2.2.2.1).
 
 const std = @import("std");
+/// Hot loops over our own frame data: checked in Debug (tests), unchecked in release builds.
+const kernel_safety = @import("builtin").mode == .debug;
 const bytes = @import("../core/bytes.zig");
 const nsc = @import("nsc.zig");
+const workers = @import("workers.zig");
 pub const bits = @import("rfx/bits.zig");
 pub const rlgr = @import("rfx/rlgr.zig");
 pub const dwt = @import("rfx/dwt.zig");
@@ -522,6 +525,7 @@ pub const band_lens = [10]usize{ 1024, 1024, 1024, 256, 256, 256, 64, 64, 64, 64
 /// RGB -> level-shifted 11.5 YCbCr (3.1.8.1.3) of the tile at `pixels[0]` (BGRX, rows
 /// `stride` apart); pixels beyond `width` x `height` replicate the edge.
 pub fn rgbToYCbCr(pixels: []const u8, stride: usize, width: u16, height: u16, y: *Component, cb: *Component, cr: *Component) Error!void {
+    @setRuntimeSafety(kernel_safety);
     if (width == 0 or height == 0) return error.InvalidDimensions;
     const w: usize = @min(width, tile_size);
     const h: usize = @min(height, tile_size);
@@ -563,6 +567,7 @@ pub fn dwtDecode(c: *Component) Error!void {
 
 /// Divide each band by 2^(f-1) in 11.5 fixed point, rounded (3.1.8.1.5); `factors` 6..15.
 pub fn quantizeBands(c: []i16, lens: []const usize, factors: []const u4) Error!void {
+    @setRuntimeSafety(kernel_safety);
     for (factors) |f| if (f < 6) return error.BadQuant;
     var off: usize = 0;
     for (lens, factors) |len, f| {
@@ -596,6 +601,7 @@ pub fn dequantize(c: *Component, q: Quant) Error!void {
 
 /// LL3 differential coding (3.1.8.1.6), in place.
 pub fn differentialEncode(ll3: []i16) Error!void {
+    @setRuntimeSafety(kernel_safety);
     var i = ll3.len;
     while (i > 1) {
         i -= 1;
@@ -794,17 +800,58 @@ pub const Encoder = struct {
         if (tiles.len > 0xFFFF) return error.TooMany;
         const lens = try gpa.alloc([3]usize, tiles.len);
         defer gpa.free(lens);
-        for (tiles, lens) |t, *l| {
-            const x: usize = @as(usize, t.x) * 64;
-            const y: usize = @as(usize, t.y) * 64;
-            const vw: u16 = @intCast(@min(64, e.opts.width - x));
-            const vh: u16 = @intCast(@min(64, e.opts.height - y));
-            const q = e.opts.quant;
-            l.* = try encodeTile(gpa, data, pixels[y * stride + x * 4 ..], stride, vw, vh, q, q, q, e.opts.entropy);
+        // Tiles are coded in parallel, each task appending to its own buffer; `at` says where a
+        // tile landed. The gather below puts them into `data` in tile order.
+        const At = struct { task: usize, off: usize };
+        const at = try gpa.alloc(At, tiles.len);
+        defer gpa.free(at);
+        const ntasks = workers.maxTasks();
+        const bufs = try gpa.alloc(std.ArrayList(u8), ntasks);
+        defer {
+            for (bufs) |*b| b.deinit(gpa);
+            gpa.free(bufs);
         }
+        @memset(bufs, .empty);
+        const errs = try gpa.alloc(?Error, ntasks);
+        defer gpa.free(errs);
+        @memset(errs, null);
+        const Job = struct {
+            e: *const Encoder,
+            pixels: []const u8,
+            stride: usize,
+            tiles: []const TileIndex,
+            lens: [][3]usize,
+            at: []At,
+            bufs: []std.ArrayList(u8),
+            errs: []?Error,
+
+            fn run(j: @This(), task: usize, i: usize) void {
+                if (j.errs[task] != null) return;
+                const t = j.tiles[i];
+                const x: usize = @as(usize, t.x) * 64;
+                const y: usize = @as(usize, t.y) * 64;
+                const vw: u16 = @intCast(@min(64, j.e.opts.width - x));
+                const vh: u16 = @intCast(@min(64, j.e.opts.height - y));
+                const q = j.e.opts.quant;
+                const buf = &j.bufs[task];
+                j.at[i] = .{ .task = task, .off = buf.items.len };
+                j.lens[i] = encodeTile(j.e.gpa, buf, j.pixels[y * j.stride + x * 4 ..], j.stride, vw, vh, q, q, q, j.e.opts.entropy) catch |err| {
+                    j.errs[task] = err;
+                    return;
+                };
+            }
+        };
+        workers.forEach(tiles.len, Job{ .e = e, .pixels = pixels, .stride = stride, .tiles = tiles, .lens = lens, .at = at, .bufs = bufs, .errs = errs }, Job.run);
+        for (errs) |m| if (m) |err| return err;
+
+        var total: usize = 0;
+        for (lens) |l| total += l[0] + l[1] + l[2];
+        try data.ensureUnusedCapacity(gpa, total);
         const out = try gpa.alloc(EncodedTile, tiles.len);
-        var off: usize = 0;
-        for (tiles, lens, out) |t, l, *o| {
+        for (tiles, lens, at, out) |t, l, a, *o| {
+            const n = l[0] + l[1] + l[2];
+            const off = data.items.len;
+            data.appendSliceAssumeCapacity(bufs[a.task].items[a.off..][0..n]);
             o.* = .{
                 .x_idx = t.x,
                 .y_idx = t.y,
@@ -812,7 +859,6 @@ pub const Encoder = struct {
                 .cb_data = data.items[off + l[0] ..][0..l[1]],
                 .cr_data = data.items[off + l[0] + l[1] ..][0..l[2]],
             };
-            off += l[0] + l[1] + l[2];
         }
         return out;
     }

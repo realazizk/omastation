@@ -218,6 +218,11 @@ pub const Options = struct {
     insert_edge: u32 = 4,
     /// The scan step grows by one after 2^skip_shift positions without a match.
     skip_shift: u5 = 7,
+    /// A segment saving less than this many sixteenths of its bytes `bail_after` bytes in goes raw
+    /// at once: weakly compressible data (planar bitmaps of noisy pictures) costs the matcher as
+    /// much as text that shrinks 10x. 0 never gives up (slow links, where every byte counts).
+    bail_gain_x16: u8 = 2,
+    bail_after: usize = 8 * 1024,
 };
 
 pub const Stats = struct {
@@ -392,7 +397,12 @@ pub const Compressor = struct {
         var i = start;
         var lit = start;
         var misses: usize = 0;
+        var checked = self.opts.bail_gain_x16 == 0;
         while (i + 4 <= end) {
+            if (!checked and i - start >= self.opts.bail_after) {
+                checked = true;
+                if (!self.gaining(&bw, lit, i, start)) return null;
+            }
             const cur = self.read32(i);
             const h = rowIndex(cur);
             if (i + 5 <= end) @prefetch(&self.rows[rowIndex(self.read32(i + 1))], .{});
@@ -457,6 +467,15 @@ pub const Compressor = struct {
         if (bw.pos + 1 >= raw_len) return null;
         const n = bw.finish();
         return if (n < raw_len) n else null;
+    }
+
+    /// Whether the output so far (with the literals pending since `lit`) saves at least
+    /// `bail_gain_x16` sixteenths of the input coded so far.
+    fn gaining(self: *const Compressor, bw: *const BitWriter, lit: usize, i: usize, start: usize) bool {
+        var bits: usize = bw.bitPos();
+        for (self.window[lit..i]) |b| bits += literal_len[b];
+        const in_bits = (i - start) * 8;
+        return bits * 16 <= in_bits * (16 - @as(usize, self.opts.bail_gain_x16));
     }
 
     inline fn worthMatch(self: *const Compressor, i: usize, len: usize, dist: usize) bool {

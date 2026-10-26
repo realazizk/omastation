@@ -26,7 +26,8 @@ pub const ColorConversion = enum {
 pub const Options = struct {
     width: u32,
     height: u32,
-    device: [:0]const u8 = "/dev/dri/renderD128",
+    /// DRM render node; null: the first of `render_nodes` whose driver encodes H.264 `profile`.
+    device: ?[:0]const u8 = null,
     profile: Profile = .high,
     rate_control: RateControl = .vbr,
     /// Target bitrate in bit/s (CBR: the rate; VBR: the average).
@@ -93,6 +94,8 @@ pub const Encoder = struct {
 
     fd: c_int,
     dpy: c.VADisplay,
+    /// The render node in use.
+    node: [:0]const u8,
     vendor: []const u8,
     enc_config: c.VAConfigID = c.VA_INVALID_ID,
     enc_ctx: c.VAContextID = c.VA_INVALID_ID,
@@ -150,18 +153,10 @@ pub const Encoder = struct {
         if (opts.qp > 51 or opts.min_qp > 51 or opts.max_qp > 51 or opts.min_qp > opts.max_qp) return error.BadInput;
         if (opts.fps == 0 or opts.bitrate == 0) return error.BadInput;
 
-        const fd = c.open(opts.device.ptr, c.O_RDWR | c.O_CLOEXEC);
-        if (fd < 0) return error.OpenDevice;
-        errdefer _ = c.close(fd);
-        const dpy = c.vaGetDisplayDRM(fd) orelse return error.VaInit;
-        _ = c.vaSetInfoCallback(dpy, null, null);
-        _ = c.vaSetErrorCallback(dpy, vaErrorCallback, null);
-        var major: c_int = 0;
-        var minor: c_int = 0;
-        if (c.vaInitialize(dpy, &major, &minor) != c.VA_STATUS_SUCCESS) return error.VaInit;
-        errdefer _ = c.vaTerminate(dpy);
+        const dev = try openDevice(opts);
+        errdefer closeDevice(dev);
 
-        var e = fresh(gpa, opts, geo, fd, dpy);
+        var e = fresh(gpa, opts, geo, dev);
         errdefer e.hdr.deinit(gpa);
         errdefer e.releaseVa();
         try e.setup();
@@ -186,18 +181,20 @@ pub const Encoder = struct {
                 e.hdr.deinit(gpa);
                 var vpp = opts;
                 vpp.conversion = .vpp;
-                e = fresh(gpa, vpp, geo, fd, dpy);
+                e = fresh(gpa, vpp, geo, dev);
                 try e.setup();
             }
         }
-        log.debug("{s}: {d}x{d} (coded {d}x{d}) {t} level {d}, {t} {d} kbit/s, conversion {t}", .{
-            e.vendor,     opts.width,      opts.height,       geo.codedWidth(),    geo.codedHeight(),
+        log.debug("{s} ({s}): {d}x{d} (coded {d}x{d}) {t} level {d}, {t} {d} kbit/s, conversion {t}", .{
+            e.node,       e.vendor,        opts.width,        opts.height,         geo.codedWidth(),  geo.codedHeight(),
             opts.profile, e.sps.level_idc, opts.rate_control, opts.bitrate / 1000, e.opts.conversion,
         });
         return e;
     }
 
-    fn fresh(gpa: Allocator, opts: Options, geo: bs.Geometry, fd: c_int, dpy: c.VADisplay) Encoder {
+    fn fresh(gpa: Allocator, opts: Options, geo: bs.Geometry, dev: Device) Encoder {
+        const fd = dev.fd;
+        const dpy = dev.dpy;
         const peak = peakBitrate(opts, opts.bitrate);
         const level = bs.chooseLevel(geo, opts.fps * picturesPerFrame(opts), peak, opts.profile);
         return .{
@@ -208,7 +205,8 @@ pub const Encoder = struct {
             .pps = .{ .cabac = opts.profile.cabac(), .high = opts.profile == .high, .transform_8x8 = opts.profile == .high },
             .fd = fd,
             .dpy = dpy,
-            .vendor = std.mem.span(c.vaQueryVendorString(dpy) orelse @as([*c]const u8, "")),
+            .node = dev.name,
+            .vendor = vendorOf(dpy),
             .bitrate = opts.bitrate,
         };
     }
@@ -561,13 +559,9 @@ pub const Encoder = struct {
     }
 
     fn setup(e: *Encoder) Error!void {
-        const profile: c.VAProfile = switch (e.opts.profile) {
-            .high => c.VAProfileH264High,
-            .main => c.VAProfileH264Main,
-            .constrained_baseline => c.VAProfileH264ConstrainedBaseline,
-        };
+        const profile = vaProfile(e.opts.profile);
         if (!e.hasEntrypoint(profile, c.VAEntrypointEncSlice)) {
-            log.err("{s}: no H.264 {t} EncSlice entrypoint", .{ e.vendor, e.opts.profile });
+            log.err("{s} ({s}): no H.264 {t} EncSlice entrypoint", .{ e.node, e.vendor, e.opts.profile });
             return error.Unsupported;
         }
 
@@ -674,11 +668,7 @@ pub const Encoder = struct {
     }
 
     fn hasEntrypoint(e: *Encoder, profile: c.VAProfile, entrypoint: c.VAEntrypoint) bool {
-        var eps: [32]c.VAEntrypoint = undefined;
-        var n: c_int = 0;
-        if (c.vaQueryConfigEntrypoints(e.dpy, profile, &eps, &n) != c.VA_STATUS_SUCCESS) return false;
-        for (eps[0..@intCast(@min(n, eps.len))]) |x| if (x == entrypoint) return true;
-        return false;
+        return dpyHasEntrypoint(e.dpy, profile, entrypoint);
     }
 
     fn upload(self: *Encoder, pixels: []const u8, stride: usize) Error!void {
@@ -962,6 +952,84 @@ fn vaCheck(st: c.VAStatus, what: []const u8) Error!void {
     return error.Vaapi;
 }
 
+// --- Render nodes -------------------------------------------------------------------------
+
+/// `/dev/dri/renderD128` .. `renderD191`: where the kernel puts DRM render nodes.
+pub const render_nodes: [64][:0]const u8 = blk: {
+    var names: [64][:0]const u8 = undefined;
+    for (&names, 0..) |*n, i| n.* = std.fmt.comptimePrint("/dev/dri/renderD{d}", .{128 + i});
+    break :blk names;
+};
+
+/// An open render node with its VA display initialized.
+const Device = struct { fd: c_int, dpy: c.VADisplay, name: [:0]const u8 };
+
+fn openVa(name: [:0]const u8) Error!Device {
+    const fd = c.open(name.ptr, c.O_RDWR | c.O_CLOEXEC);
+    if (fd < 0) return error.OpenDevice;
+    errdefer _ = c.close(fd);
+    const dpy = c.vaGetDisplayDRM(fd) orelse return error.VaInit;
+    _ = c.vaSetInfoCallback(dpy, null, null);
+    _ = c.vaSetErrorCallback(dpy, vaErrorCallback, null);
+    var major: c_int = 0;
+    var minor: c_int = 0;
+    if (c.vaInitialize(dpy, &major, &minor) != c.VA_STATUS_SUCCESS) return error.VaInit;
+    return .{ .fd = fd, .dpy = dpy, .name = name };
+}
+
+fn closeDevice(d: Device) void {
+    _ = c.vaTerminate(d.dpy);
+    _ = c.close(d.fd);
+}
+
+fn vendorOf(dpy: c.VADisplay) []const u8 {
+    return std.mem.span(c.vaQueryVendorString(dpy) orelse @as([*c]const u8, ""));
+}
+
+fn vaProfile(p: Profile) c.VAProfile {
+    return switch (p) {
+        .high => c.VAProfileH264High,
+        .main => c.VAProfileH264Main,
+        .constrained_baseline => c.VAProfileH264ConstrainedBaseline,
+    };
+}
+
+fn dpyHasEntrypoint(dpy: c.VADisplay, profile: c.VAProfile, entrypoint: c.VAEntrypoint) bool {
+    var eps: [32]c.VAEntrypoint = undefined;
+    var n: c_int = 0;
+    if (c.vaQueryConfigEntrypoints(dpy, profile, &eps, &n) != c.VA_STATUS_SUCCESS) return false;
+    for (eps[0..@intCast(@min(n, eps.len))]) |x| if (x == entrypoint) return true;
+    return false;
+}
+
+/// `opts.device`, or else the first render node whose driver encodes H.264 `opts.profile`:
+/// on a hybrid laptop renderD128 is often the dGPU, whose driver only decodes, and the
+/// iGPU behind it encodes. error.Unsupported when nodes have VA-API but none encodes;
+/// error.OpenDevice / error.VaInit when none does (the first failure).
+fn openDevice(opts: Options) Error!Device {
+    if (opts.device) |name| return openVa(name);
+    const profile = vaProfile(opts.profile);
+    var first_err: ?Error = null;
+    var with_va: usize = 0;
+    for (&render_nodes) |name| {
+        if (c.access(name.ptr, c.F_OK) != 0) continue;
+        const d = openVa(name) catch |err| {
+            log.debug("{s}: {t}, trying the next render node", .{ name, err });
+            if (first_err == null) first_err = err;
+            continue;
+        };
+        with_va += 1;
+        if (dpyHasEntrypoint(d.dpy, profile, c.VAEntrypointEncSlice)) return d;
+        log.debug("{s} ({s}): no H.264 {t} encoder, trying the next render node", .{ name, vendorOf(d.dpy), opts.profile });
+        closeDevice(d);
+    }
+    if (with_va > 0) {
+        log.err("no render node encodes H.264 {t} ({d} with VA-API); --gpu picks one explicitly", .{ opts.profile, with_va });
+        return error.Unsupported;
+    }
+    return first_err orelse error.OpenDevice;
+}
+
 fn unsupported(what: []const u8) Error {
     log.err("VA driver does not support {s}", .{what});
     return error.Unsupported;
@@ -982,7 +1050,32 @@ fn nowNs() u64 {
 const testing = std.testing;
 
 fn haveGpu() bool {
-    return c.access("/dev/dri/renderD128", c.R_OK | c.W_OK) == 0;
+    for (&render_nodes) |n| if (c.access(n.ptr, c.R_OK | c.W_OK) == 0) return true;
+    return false;
+}
+
+test "render node names" {
+    try testing.expectEqualStrings("/dev/dri/renderD128", render_nodes[0]);
+    try testing.expectEqualStrings("/dev/dri/renderD191", render_nodes[63]);
+}
+
+test "GPU: the probe picks a node that encodes, and naming that node gives the same one" {
+    if (!haveGpu()) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var probed = Encoder.init(gpa, .{ .width = 640, .height = 480 }) catch |err| switch (err) {
+        error.Unsupported, error.VaInit, error.OpenDevice => return error.SkipZigTest,
+        else => return err,
+    };
+    defer probed.deinit();
+    try testing.expect(std.mem.startsWith(u8, probed.node, "/dev/dri/renderD"));
+    var named = try Encoder.init(gpa, .{ .width = 640, .height = 480, .device = probed.node });
+    defer named.deinit();
+    try testing.expectEqualStrings(probed.node, named.node);
+    try testing.expectEqualStrings(probed.vendor, named.vendor);
+}
+
+test "a named node that does not exist is error.OpenDevice, probing never reaches it" {
+    try testing.expectError(error.OpenDevice, Encoder.init(testing.allocator, .{ .width = 64, .height = 64, .device = "/dev/dri/renderD999" }));
 }
 
 fn fillTestFrame(buf: []u8, w: u32, h: u32, frame: u32) void {

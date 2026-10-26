@@ -71,10 +71,11 @@ pub fn drawAnimatedPattern(fb: *Framebuffer, n: u32) void {
 
 /// Frame `n` of a synthetic video in a centred `w` x `h` window; nothing outside it changes.
 pub fn drawVideo(fb: *Framebuffer, w: usize, h: usize, n: u32) void {
-    const vw = @min(w, fb.width);
-    const vh = @min(h, fb.height);
-    const x0 = (fb.width - vw) / 2;
-    const y0 = (fb.height - vh) / 2;
+    // usize throughout: @min narrows to u16 here, and u16 * 4 overflows at 4K.
+    const vw: usize = @min(w, fb.width);
+    const vh: usize = @min(h, fb.height);
+    const x0: usize = (fb.width - vw) / 2;
+    const y0: usize = (fb.height - vh) / 2;
     const t: usize = n;
     const cx = (t * 7) % @max(vw, 1);
     const cy = vh / 2 + (t * 3) % @max(vh / 2, 1) - vh / 4;

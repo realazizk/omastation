@@ -3,6 +3,8 @@
 //! The high band is halved, as RDP decoders double it back; stored coefficients saturate to i16.
 
 const std = @import("std");
+/// Hot loops over our own frame data: checked in Debug (tests), unchecked in release builds.
+const kernel_safety = @import("builtin").mode == .debug;
 
 inline fn sat(v: i32) i16 {
     return @intCast(std.math.clamp(v, std.math.minInt(i16), std.math.maxInt(i16)));
@@ -13,6 +15,7 @@ inline fn sat(v: i32) i16 {
 /// One forward level on the (2 * sw) x (2 * sw) block at the start of
 /// `buf`, writing HL, LH, HH, LL (sw x sw each) in that order.
 fn encodeBlock(buf: []i16, tmp: []i16, sw: usize) void {
+    @setRuntimeSafety(kernel_safety);
     const tw = 2 * sw;
     const lo = tmp[0 .. sw * tw];
     const hi = tmp[sw * tw .. 2 * sw * tw];
@@ -112,6 +115,7 @@ const re_offsets = [3]usize{ 0, 3007, 3807 };
 
 /// Lifts x[0 .. 2m+1] into L[0 .. m+1] and H[0 .. m], mirrored at both ends.
 fn liftOdd(x: []const i32, lo: []i32, hi: []i32) void {
+    @setRuntimeSafety(kernel_safety);
     const m = hi.len;
     for (0..m) |n| hi[n] = (x[2 * n + 1] - ((x[2 * n] + x[2 * n + 2]) >> 1)) >> 1;
     lo[0] = x[0] + hi[0];
@@ -122,6 +126,7 @@ fn liftOdd(x: []const i32, lo: []i32, hi: []i32) void {
 /// 64 samples get a 65th, x[64] = 2 x[63] - x[62], whose high value (always 0) is
 /// dropped; 33 and 17 samples are already odd.
 fn liftRe(x: []const i32, lo: []i32, hi: []i32) void {
+    @setRuntimeSafety(kernel_safety);
     if (x.len == 64) {
         var ext: [65]i32 = undefined;
         @memcpy(ext[0..64], x);
@@ -135,6 +140,7 @@ fn liftRe(x: []const i32, lo: []i32, hi: []i32) void {
 /// One forward Reduce-Extrapolate level on the n x n block at the start of
 /// `buf` (row step n): HL (nl rows of nh), LH (nh rows of nl), HH, LL.
 fn encodeBlockRe(buf: []i16, level: usize) void {
+    @setRuntimeSafety(kernel_safety);
     const n = if (level == 1) 64 else bandL(level - 1);
     const nl = bandL(level);
     const nh = bandH(level);

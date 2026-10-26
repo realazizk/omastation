@@ -14,6 +14,7 @@ const progressive = @import("../codec/progressive.zig");
 const rfx = @import("../codec/rfx.zig");
 const clear = @import("../codec/clear.zig");
 const encoder_mod = @import("encoder.zig");
+const workers = @import("../codec/workers.zig");
 const video_mod = @import("video.zig");
 const conn_mod = @import("conn.zig");
 const Conn = conn_mod.Conn;
@@ -80,6 +81,12 @@ pub const Surface = struct {
     pieces: std.ArrayList(Piece) = .empty,
     avc_rects: std.ArrayList(gfx.Rect16) = .empty,
     piece_rects: std.ArrayList(gfx.Rect16) = .empty,
+    /// writePieces scratch: the wire pieces, a batch's planar rects and their bitmaps.
+    work: std.ArrayList(Work) = .empty,
+    batch_rects: std.ArrayList(gfx.Rect16) = .empty,
+    batch_bufs: encoder_mod.BufPool = .{},
+    /// Bytes a planar piece came to lately, 0 before any; sizes the batches coded ahead.
+    planar_bytes_per_piece: usize = 0,
 
     pub fn deinit(s: *Surface, gpa: std.mem.Allocator) void {
         if (s.h264) |*h| h.deinit();
@@ -95,6 +102,9 @@ pub const Surface = struct {
         s.pieces.deinit(gpa);
         s.avc_rects.deinit(gpa);
         s.piece_rects.deinit(gpa);
+        s.work.deinit(gpa);
+        s.batch_rects.deinit(gpa);
+        s.batch_bufs.deinit(gpa);
         gpa.free(s.ref_qp);
         s.dirty.deinit(gpa);
         s.refine_rects.deinit(gpa);
@@ -549,12 +559,12 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     };
     const r = nominal(c);
     if (s.h264 == null) {
-        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = crop, .rate_control = .cqp, .qp = pacing.avc_min_qp });
+        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = crop, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device });
         s.need_idr = true;
         // The refinement wait is picked once, from the link's rate, as Windows' encoder does.
         const rate = c.flow.rate() * 8;
         s.quiet_ms = if (rate > 0 and rate < pacing.refine_quiet_slow_bps) pacing.refine_quiet_slow_ms else pacing.refine_quiet_ms;
-        log.info("{s}: H.264 encoder ready ({d}x{d}, QP {d}..{d} per frame from its byte budget, refined after {d} ms still, {d} fps at most)", .{ c.peer, width, height, pacing.avc_min_qp, pacing.avc_max_qp, s.quiet_ms, r.fps });
+        log.info("{s}: H.264 encoder ready on {s} ({d}x{d}, QP {d}..{d} per frame from its byte budget, refined after {d} ms still, {d} fps at most)", .{ c.peer, s.h264.?.node, width, height, pacing.avc_min_qp, pacing.avc_max_qp, s.quiet_ms, r.fps });
     }
     const h = &s.h264.?;
     if (h.opts.width != width or h.opts.height != height) {
@@ -623,9 +633,9 @@ fn writeAvc444(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16) 
     const r = nominal(c);
     if (s.h264 == null) {
         // Init probes AVC444 on the device: error.Unsupported drops to AVC420.
-        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = false, .avc444 = .v2, .rate_control = .cqp, .qp = pacing.avc_min_qp });
+        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = false, .avc444 = .v2, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device });
         s.need_idr = true;
-        log.info("{s}: H.264 AVC444v2 encoder ready ({d}x{d}, QP per frame from its byte budget, {d} fps at most)", .{ c.peer, width, height, r.fps });
+        log.info("{s}: H.264 AVC444v2 encoder ready on {s} ({d}x{d}, QP per frame from its byte budget, {d} fps at most)", .{ c.peer, s.h264.?.node, width, height, r.fps });
     }
     const h = &s.h264.?;
     if (h.opts.width != width or h.opts.height != height) {
@@ -879,64 +889,105 @@ pub fn writeLossless(c: *Conn, w: *bytes.Writer, sid: u16, leftover: Leftover) c
     try writePieces(c, w, sid, s.pieces.items, leftover, 0, null);
 }
 
+/// A lossless piece as it goes on the wire: ClearCodec for a piece's changed pixels, or planar
+/// for one `pieceWidth` slice of a piece.
+const Work = struct { rect: gfx.Rect16, piece: usize, clear: bool };
+
 /// In a frame that holds `spent` bytes already.
 fn writePieces(c: *Conn, w: *bytes.Writer, sid: u16, pieces: []const Piece, leftover: Leftover, spent: usize, limit: ?usize) conn_mod.Error!void {
     const e = &c.enc;
+    const s = &c.ch.surf;
+    const gpa = c.gpa;
     // Counted before ZGFX, which shrinks them by its recent ratio (or `limit`, the caller's).
     const raw = limit orelse c.ch.rawBudget(c.frameBudget());
     const paced = raw != std.math.maxInt(usize);
     const budget = if (paced) raw -| spent else raw;
     const piece = pacing.pieceWidth(budget);
-    const begin = w.len();
-    var rest: std.ArrayList(gfx.Rect16) = .empty;
-    defer rest.deinit(c.gpa);
-    var sent = false;
-    for (pieces) |pc| {
-        const r = pc.rect;
-        if (sent and w.len() - begin >= budget) {
-            try rest.append(c.gpa, r);
-            continue;
-        }
+
+    // The wire pieces in order. Planar ones are coded ahead in parallel batches sized to the
+    // budget left; each is then written, or cut, exactly as a one-by-one walk would.
+    s.work.clearRetainingCapacity();
+    for (pieces, 0..) |pc, pi| {
         if (clearFor(c, pc)) |t| {
-            const start = w.len();
-            if (writeClear(c, w, sid, t)) |_| {
-                c.ch.stats.clear_rects += 1;
-                sent = true;
-                continue;
-            } else |err| {
-                w.list.shrinkRetainingCapacity(start);
-                if (err == error.OutOfMemory) return error.OutOfMemory;
-                log.debug("{s}: ClearCodec failed ({t}); planar", .{ c.peer, err });
+            try s.work.append(gpa, .{ .rect = t, .piece = pi, .clear = true });
+        } else if (!paced) {
+            try s.work.append(gpa, .{ .rect = pc.rect, .piece = pi, .clear = false });
+        } else {
+            var x = pc.rect.left;
+            while (x < pc.rect.right) {
+                const x1 = @min(pc.rect.right, x + piece);
+                try s.work.append(gpa, .{ .rect = .{ .left = x, .top = pc.rect.top, .right = x1, .bottom = pc.rect.bottom }, .piece = pi, .clear = false });
+                x = x1;
             }
-        }
-        if (!paced) {
-            try e.writePlanarRect(w, sid, r);
-            c.ch.stats.planar_rects += 1;
-            sent = true;
-            continue;
-        }
-        var x = r.left;
-        while (x < r.right) {
-            if (sent and w.len() - begin >= budget) {
-                try rest.append(c.gpa, .{ .left = x, .top = r.top, .right = r.right, .bottom = r.bottom });
-                break;
-            }
-            const x1 = @min(r.right, x + piece);
-            try e.writePlanarRect(w, sid, .{ .left = x, .top = r.top, .right = x1, .bottom = r.bottom });
-            c.ch.stats.planar_rects += 1;
-            sent = true;
-            x = x1;
         }
     }
+    const begin = w.len();
+    var rest: std.ArrayList(gfx.Rect16) = .empty;
+    defer rest.deinit(gpa);
+    var sent = false;
+    var planar_bytes: usize = 0;
+    var planar_n: usize = 0;
+    const items = s.work.items;
+    const ntasks = workers.maxTasks();
+    var done: usize = 0;
+    outer: while (done < items.len) {
+        var batch = items.len - done;
+        if (paced) {
+            const est = if (s.planar_bytes_per_piece > 0) s.planar_bytes_per_piece else @as(usize, 64) * piece * 3 / 2;
+            const left = budget -| (w.len() - begin);
+            batch = @min(batch, @max(1, @min(4 * ntasks, left / est + 1)));
+        }
+        s.batch_rects.clearRetainingCapacity();
+        for (items[done..][0..batch]) |it| if (!it.clear) try s.batch_rects.append(gpa, it.rect);
+        try s.batch_bufs.ensure(gpa, s.batch_rects.items.len);
+        try e.encodePlanarRects(s.batch_rects.items, s.batch_bufs.items);
+        var k: usize = 0; // planar index within the batch
+        for (items[done..][0..batch], done..) |it, i| {
+            if (sent and w.len() - begin >= budget) {
+                // Cut: the rest of this piece, then every later piece whole.
+                const pr = pieces[it.piece].rect;
+                try rest.append(gpa, if (it.clear) pr else .{ .left = it.rect.left, .top = pr.top, .right = pr.right, .bottom = pr.bottom });
+                var last = it.piece;
+                for (items[i + 1 ..]) |later| if (later.piece != last) {
+                    try rest.append(gpa, pieces[later.piece].rect);
+                    last = later.piece;
+                };
+                c.pacing.cut();
+                break :outer;
+            }
+            if (it.clear) {
+                const start = w.len();
+                if (writeClear(c, w, sid, it.rect)) |_| {
+                    c.ch.stats.clear_rects += 1;
+                } else |err| {
+                    w.list.shrinkRetainingCapacity(start);
+                    if (err == error.OutOfMemory) return error.OutOfMemory;
+                    log.debug("{s}: ClearCodec failed ({t}); planar", .{ c.peer, err });
+                    // ClearCodec pieces are one tile at most: one planar slice.
+                    try e.writePlanarRect(w, sid, pieces[it.piece].rect);
+                    c.ch.stats.planar_rects += 1;
+                }
+                sent = true;
+                continue;
+            }
+            const payload = s.batch_bufs.items[k].items;
+            k += 1;
+            try encoder_mod.Encoder.writePlanarPayload(w, sid, it.rect, payload);
+            c.ch.stats.planar_rects += 1;
+            planar_bytes += payload.len;
+            planar_n += 1;
+            sent = true;
+        }
+        done += batch;
+    }
+    if (planar_n > 0) s.planar_bytes_per_piece = planar_bytes / planar_n;
     for (pieces) |pc| if (pc.exact) e.markLossy(&.{pc.rect}, false);
     if (rest.items.len > 0) {
         switch (leftover) {
             .owed => e.owe(rest.items),
             .lossy => e.markLossy(rest.items, true),
         }
-        c.pacing.cut();
     }
-    const s = &c.ch.surf;
     // Lossless rects owe no AVC444 chroma: a later chroma bitmap would put older colours over them.
     if (s.chroma) |*debt| for (pieces) |pc| debt.sent(.both, &.{pc.rect}) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,

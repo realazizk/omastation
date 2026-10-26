@@ -2,6 +2,8 @@
 //! pass of RemoteFX Progressive tiles (MS-RDPEGFX 3.2.8.1.5.1, always RLGR1).
 
 const std = @import("std");
+/// Hot loops over our own frame data: checked in Debug (tests), unchecked in release builds.
+const kernel_safety = @import("builtin").mode == .debug;
 const bits = @import("bits.zig");
 
 pub const Mode = enum { rlgr1, rlgr3 };
@@ -56,6 +58,7 @@ inline fn codeGR(w: *bits.Writer, krp: *u32, val: u32) void {
 /// The byte count. Trailing zeros end as full 1 << k escapes plus the terminator, which
 /// strict and zero-filling decoders both accept (the spec leaves termination undefined).
 pub fn encode(mode: Mode, coeffs: []const i16, out: []u8) error{BufferTooSmall}!usize {
+    @setRuntimeSafety(kernel_safety);
     var w = bits.Writer.init(out);
     var k: u5 = 1;
     var kp: u32 = 1 << lsgr;

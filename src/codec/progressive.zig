@@ -5,6 +5,7 @@
 const std = @import("std");
 const bytes = @import("../core/bytes.zig");
 const rfx = @import("rfx.zig");
+const workers = @import("workers.zig");
 const bits = rfx.bits;
 const rlgr = rfx.rlgr;
 const dwt = rfx.dwt;
@@ -660,6 +661,24 @@ const TileState = struct {
     dirty: Rect,
 };
 
+/// Tiles an upgrade pass codes before checking its byte budget again.
+const upgrade_min_batch: usize = 16;
+
+/// A tile's coded output of the pass in flight, kept per tile so tiles code in parallel and
+/// the buffers are reused frame after frame: Y, Cb, Cr (first pass) or SRL + raw per component.
+const TileOut = struct {
+    parts: [6]std.ArrayList(u8) = @splat(.empty),
+    difference: bool = false,
+
+    fn clear(o: *TileOut) void {
+        for (&o.parts) |*p| p.clearRetainingCapacity();
+    }
+
+    fn deinit(o: *TileOut, gpa: std.mem.Allocator) void {
+        for (&o.parts) |*p| p.deinit(gpa);
+    }
+};
+
 fn rectUnion(a: Rect, b: Rect) Rect {
     const x0 = @min(a.x, b.x);
     const y0 = @min(a.y, b.y);
@@ -693,6 +712,10 @@ pub const Encoder = struct {
     bands: []const Band = &tile_bands_extrapolate,
     tiles_x: usize = 0,
     tiles: []?*TileState = &.{},
+    /// Per tile, `tiles` order.
+    outs: []TileOut = &.{},
+    /// Bytes per tile of the last upgrade pass, 0 before one; sizes the parallel batches.
+    upgrade_bytes_per_tile: usize = 0,
     frame_index: u32 = 0,
     context_sent: bool = false,
 
@@ -714,6 +737,9 @@ pub const Encoder = struct {
         const tiles = try gpa.alloc(?*TileState, tx * ty);
         @memset(tiles, null);
         errdefer gpa.free(tiles);
+        const outs = try gpa.alloc(TileOut, tx * ty);
+        @memset(outs, .{});
+        errdefer gpa.free(outs);
         const levels = try gpa.dupe(ProgQuant, opts.levels);
         return .{
             .gpa = gpa,
@@ -724,6 +750,7 @@ pub const Encoder = struct {
             .bands = if (opts.reduce_extrapolate) &tile_bands_extrapolate else &tile_bands_original,
             .tiles_x = tx,
             .tiles = tiles,
+            .outs = outs,
         };
     }
 
@@ -732,9 +759,21 @@ pub const Encoder = struct {
             for (&ts.comps) |*c| c.deinit();
             e.gpa.destroy(ts);
         };
+        for (e.outs) |*o| o.deinit(e.gpa);
+        e.gpa.free(e.outs);
         e.gpa.free(e.tiles);
         e.gpa.free(e.levels);
         e.* = undefined;
+    }
+
+    fn freeTile(e: *Encoder, ts: *TileState) void {
+        for (&ts.comps) |*c| c.deinit();
+        e.gpa.destroy(ts);
+    }
+
+    /// The first error any task hit.
+    fn firstError(errs: []const ?Error) Error!void {
+        for (errs) |m| if (m) |err| return err;
     }
 
     fn chromaQuant(e: *const Encoder) ComponentQuant {
@@ -821,49 +860,79 @@ pub const Encoder = struct {
         const list = rfx.tilesForRects(rrs, idx) catch |err| return mapRfx(err);
         if (list.len > 0xFFFF) return error.InvalidDimensions;
 
-        var scratch: ?*TileState = null;
-        defer if (scratch) |s| {
-            for (&s.comps) |*c| c.deinit();
-            gpa.destroy(s);
+        // Tiles code in parallel: each touches its own TileState and TileOut. Without tracking
+        // every tile starts from a blank state, so each task keeps one scratch state.
+        const ntasks = workers.maxTasks();
+        const scratch = try gpa.alloc(?*TileState, ntasks);
+        defer {
+            for (scratch) |s| if (s) |ts| e.freeTile(ts);
+            gpa.free(scratch);
+        }
+        @memset(scratch, null);
+        const errs = try gpa.alloc(?Error, ntasks);
+        defer gpa.free(errs);
+        @memset(errs, null);
+        const progressive = e.levels.len > 0;
+        const Job = struct {
+            e: *Encoder,
+            pixels: []const u8,
+            stride: usize,
+            rrs: []const rfx.Rect,
+            list: []const rfx.TileIndex,
+            scratch: []?*TileState,
+            errs: []?Error,
+
+            fn run(j: @This(), task: usize, i: usize) void {
+                if (j.errs[task] != null) return;
+                j.tile(task, j.list[i]) catch |err| {
+                    j.errs[task] = err;
+                };
+            }
+
+            fn tile(j: @This(), task: usize, t: rfx.TileIndex) Error!void {
+                const e_ = j.e;
+                var dq: [3][4096]i16 = undefined;
+                try e_.tileDwtq(j.pixels, j.stride, t.x, t.y, &dq);
+                const index = @as(usize, t.y) * e_.tiles_x + t.x;
+                var ts: *TileState = undefined;
+                var sent = false;
+                if (e_.tracking()) {
+                    const slot = &e_.tiles[index];
+                    if (slot.* == null) slot.* = try e_.newTile();
+                    ts = slot.*.?;
+                    sent = ts.comps[0].started;
+                } else {
+                    if (j.scratch[task] == null) j.scratch[task] = try e_.newTile();
+                    ts = j.scratch[task].?;
+                }
+                const diff = e_.opts.subband_diffing and sent and try chooseDifference(e_.bands, &dq[0], ts.comps[0].ref);
+                const o = &e_.outs[index];
+                o.clear();
+                for (&ts.comps, &dq, o.parts[0..3], 0..) |*c, *d, *p, ci| try c.firstPass(p, d, diff, &e_.bitpos(0, ci));
+                o.difference = diff;
+                var area: ?Rect = null;
+                for (j.rrs) |r| {
+                    const cl = clip(r, t) orelse continue;
+                    area = if (area) |a| rectUnion(a, cl) else cl;
+                }
+                ts.dirty = if (ts.level < e_.levels.len and sent) rectUnion(ts.dirty, area.?) else area.?;
+                ts.level = 0; // the first level; 100% already when there are no levels
+            }
         };
+        workers.forEach(list.len, Job{ .e = e, .pixels = pixels, .stride = stride, .rrs = rrs, .list = list, .scratch = scratch, .errs = errs }, Job.run);
+        try firstError(errs);
+
         var blocks: std.ArrayList(u8) = .empty;
         defer blocks.deinit(gpa);
         var bw = bytes.Writer.init(&blocks, gpa);
-        var data: [3]std.ArrayList(u8) = .{ .empty, .empty, .empty };
-        defer for (&data) |*d| d.deinit(gpa);
         const qi = e.quantIdx();
-        const progressive = e.levels.len > 0;
         for (list) |t| {
-            var dq: [3][4096]i16 = undefined;
-            try e.tileDwtq(pixels, stride, t.x, t.y, &dq);
-            const slot = &e.tiles[@as(usize, t.y) * e.tiles_x + t.x];
-            var ts: *TileState = undefined;
-            var sent = false;
-            if (e.tracking()) {
-                if (slot.* == null) slot.* = try e.newTile();
-                ts = slot.*.?;
-                sent = ts.comps[0].started;
-            } else {
-                if (scratch == null) scratch = try e.newTile();
-                ts = scratch.?;
-            }
-            const diff = e.opts.subband_diffing and sent and try chooseDifference(e.bands, &dq[0], ts.comps[0].ref);
-            for (&ts.comps, &dq, &data, 0..) |*c, *d, *o, ci| {
-                o.clearRetainingCapacity();
-                try c.firstPass(o, d, diff, &e.bitpos(0, ci));
-            }
-            var area: ?Rect = null;
-            for (rrs) |r| {
-                const cl = clip(r, t) orelse continue;
-                area = if (area) |a| rectUnion(a, cl) else cl;
-            }
-            ts.dirty = if (ts.level < e.levels.len and sent) rectUnion(ts.dirty, area.?) else area.?;
-            ts.level = if (progressive) 0 else e.levels.len;
-            const flags: u8 = if (diff) tile_flag_difference else 0;
+            const o = &e.outs[@as(usize, t.y) * e.tiles_x + t.x];
+            const flags: u8 = if (o.difference) tile_flag_difference else 0;
             if (progressive) {
-                try writeTileFirst(&bw, .{ .quant_idx_y = qi[0], .quant_idx_cb = qi[1], .quant_idx_cr = qi[2], .x_idx = t.x, .y_idx = t.y, .flags = flags, .quality = 0, .y_data = data[0].items, .cb_data = data[1].items, .cr_data = data[2].items });
+                try writeTileFirst(&bw, .{ .quant_idx_y = qi[0], .quant_idx_cb = qi[1], .quant_idx_cr = qi[2], .x_idx = t.x, .y_idx = t.y, .flags = flags, .quality = 0, .y_data = o.parts[0].items, .cb_data = o.parts[1].items, .cr_data = o.parts[2].items });
             } else {
-                try writeTileSimple(&bw, .{ .quant_idx_y = qi[0], .quant_idx_cb = qi[1], .quant_idx_cr = qi[2], .x_idx = t.x, .y_idx = t.y, .flags = flags, .y_data = data[0].items, .cb_data = data[1].items, .cr_data = data[2].items });
+                try writeTileSimple(&bw, .{ .quant_idx_y = qi[0], .quant_idx_cb = qi[1], .quant_idx_cr = qi[2], .x_idx = t.x, .y_idx = t.y, .flags = flags, .y_data = o.parts[0].items, .cb_data = o.parts[1].items, .cr_data = o.parts[2].items });
             }
         }
         var qbuf: [2]ComponentQuant = undefined;
@@ -924,33 +993,71 @@ pub const Encoder = struct {
         var blocks: std.ArrayList(u8) = .empty;
         defer blocks.deinit(gpa);
         var bw = bytes.Writer.init(&blocks, gpa);
-        var parts: [6]std.ArrayList(u8) = @splat(.empty);
-        defer for (&parts) |*p| p.deinit(gpa);
         const qi = e.quantIdx();
-        for (e.tiles, 0..) |slot, i| {
-            const ts = slot orelse continue;
-            if (ts.level >= e.levels.len) continue;
+        // The pending tiles in order, upgraded in parallel batches sized to the bytes left
+        // (a fixed minimum, so the output does not depend on the thread count), written in
+        // order after each batch; the pass stops once `max_bytes` is reached.
+        const pend = try gpa.alloc(usize, pending);
+        defer gpa.free(pend);
+        var np: usize = 0;
+        for (e.tiles, 0..) |slot, i| if (slot) |ts| if (ts.level < e.levels.len) {
+            pend[np] = i;
+            np += 1;
+        };
+        const ntasks = workers.maxTasks();
+        const errs = try gpa.alloc(?Error, ntasks);
+        defer gpa.free(errs);
+        const Job = struct {
+            e: *Encoder,
+            pend: []const usize,
+            errs: []?Error,
+
+            fn run(j: @This(), task: usize, k: usize) void {
+                if (j.errs[task] != null) return;
+                const i = j.pend[k];
+                const ts = j.e.tiles[i].?;
+                const next = ts.level + 1;
+                const o = &j.e.outs[i];
+                o.clear();
+                for (&ts.comps, 0..) |*c, ci| c.upgradePass(&o.parts[2 * ci], &o.parts[2 * ci + 1], &j.e.bitpos(next, ci)) catch |err| {
+                    j.errs[task] = err;
+                    return;
+                };
+                ts.level = next;
+            }
+        };
+        var done: usize = 0;
+        while (done < pend.len) {
             if (rects.items.len > 0 and blocks.items.len >= max_bytes) break;
-            const next = ts.level + 1;
-            for (&parts) |*p| p.clearRetainingCapacity();
-            for (&ts.comps, 0..) |*c, ci| try c.upgradePass(&parts[2 * ci], &parts[2 * ci + 1], &e.bitpos(next, ci));
-            ts.level = next;
-            try writeTileUpgrade(&bw, .{
-                .quant_idx_y = qi[0],
-                .quant_idx_cb = qi[1],
-                .quant_idx_cr = qi[2],
-                .x_idx = @intCast(i % e.tiles_x),
-                .y_idx = @intCast(i / e.tiles_x),
-                .quality = if (next < e.levels.len) index[next] else quality_full,
-                .y_srl = parts[0].items,
-                .y_raw = parts[1].items,
-                .cb_srl = parts[2].items,
-                .cb_raw = parts[3].items,
-                .cr_srl = parts[4].items,
-                .cr_raw = parts[5].items,
-            });
-            rects.appendAssumeCapacity(ts.dirty);
+            var batch: usize = upgrade_min_batch;
+            const per_tile = if (rects.items.len > 0) blocks.items.len / rects.items.len else e.upgrade_bytes_per_tile;
+            if (per_tile > 0) batch = @max(batch, (max_bytes - blocks.items.len) / per_tile + 1);
+            batch = @min(batch, pend.len - done);
+            @memset(errs, null);
+            workers.forEach(batch, Job{ .e = e, .pend = pend[done..][0..batch], .errs = errs }, Job.run);
+            try firstError(errs);
+            for (pend[done..][0..batch]) |i| {
+                const ts = e.tiles[i].?;
+                const o = &e.outs[i];
+                try writeTileUpgrade(&bw, .{
+                    .quant_idx_y = qi[0],
+                    .quant_idx_cb = qi[1],
+                    .quant_idx_cr = qi[2],
+                    .x_idx = @intCast(i % e.tiles_x),
+                    .y_idx = @intCast(i / e.tiles_x),
+                    .quality = if (ts.level < e.levels.len) index[ts.level] else quality_full,
+                    .y_srl = o.parts[0].items,
+                    .y_raw = o.parts[1].items,
+                    .cb_srl = o.parts[2].items,
+                    .cb_raw = o.parts[3].items,
+                    .cr_srl = o.parts[4].items,
+                    .cr_raw = o.parts[5].items,
+                });
+                rects.appendAssumeCapacity(ts.dirty);
+            }
+            done += batch;
         }
+        if (rects.items.len > 0) e.upgrade_bytes_per_tile = blocks.items.len / rects.items.len;
         var qbuf: [2]ComponentQuant = undefined;
         try e.writeStream(out, .{
             .rects = rects.items,
@@ -1027,6 +1134,45 @@ pub fn writeDeleteEncodingContext(w: *bytes.Writer, surface_id: u16, codec_conte
     try w.u32le(14);
     try w.u16le(surface_id);
     try w.u32le(codec_context_id);
+}
+
+test "tiles coded in parallel give the same bytes as one task, first pass and upgrades" {
+    const gpa = std.testing.allocator;
+    const w: u16 = 300;
+    const h: u16 = 200;
+    const px = try gpa.alloc(u8, @as(usize, w) * h * 4);
+    defer gpa.free(px);
+    const lv = [_]ProgQuant{
+        .{ .quality = 50, .y = .{ .ll3 = 2, .hl3 = 2, .lh3 = 2, .hh3 = 3, .hl2 = 3, .lh2 = 3, .hh2 = 4, .hl1 = 4, .lh1 = 4, .hh1 = 4 }, .cb = .{ .ll3 = 2, .hl3 = 2, .lh3 = 2, .hh3 = 3, .hl2 = 3, .lh2 = 3, .hh2 = 4, .hl1 = 4, .lh1 = 4, .hh1 = 4 }, .cr = .{ .ll3 = 2, .hl3 = 2, .lh3 = 2, .hh3 = 3, .hl2 = 3, .lh2 = 3, .hh2 = 4, .hl1 = 4, .lh1 = 4, .hh1 = 4 } },
+    };
+    var streams: [2]std.ArrayList(u8) = .{ .empty, .empty };
+    defer for (&streams) |*s| s.deinit(gpa);
+    const saved = workers.maxTasks();
+    defer workers.setMaxTasks(saved);
+    for ([_]usize{ 1, 5 }, &streams) |tasks, *stream| {
+        workers.setMaxTasks(tasks);
+        var e = try Encoder.init(gpa, w, h, .{ .levels = &lv });
+        defer e.deinit();
+        for (0..3) |frame| {
+            for (px, 0..) |*b, i| b.* = @truncate((i * 7 + frame * 13) ^ (i >> 5));
+            try e.encodeFrame(stream, px, @as(usize, w) * 4, &.{});
+            // a partial frame: three tiles
+            try e.encodeFrame(stream, px, @as(usize, w) * 4, &.{.{ .x = 70, .y = 10, .width = 150, .height = 40 }});
+            // upgrades, with a byte budget so batches get cut
+            while (try e.encodeUpgradeWithin(stream, 3000)) {}
+        }
+        var rfx_enc = try rfx.Encoder.init(gpa, .{ .width = w, .height = h });
+        defer rfx_enc.deinit();
+        try rfx_enc.encodeFrame(stream, px, @as(usize, w) * 4, &.{});
+        const msgs = try rfx_enc.encodeFrameSplit(px, @as(usize, w) * 4, &.{}, 20_000);
+        defer {
+            for (msgs) |m| gpa.free(m);
+            gpa.free(msgs);
+        }
+        for (msgs) |m| try stream.appendSlice(gpa, m);
+    }
+    try std.testing.expect(streams[0].items.len > 10_000);
+    try std.testing.expectEqualSlices(u8, streams[0].items, streams[1].items);
 }
 
 test "SRL of the MS-RDPEGFX 4.1.2.1.2 entries" {

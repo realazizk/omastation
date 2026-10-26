@@ -17,3 +17,4 @@ pub const clear = @import("clear.zig");
 pub const interleaved = @import("interleaved.zig");
 pub const bulk = @import("bulk.zig");
 pub const avc444 = @import("avc444.zig");
+pub const workers = @import("workers.zig");

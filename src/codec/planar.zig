@@ -3,6 +3,8 @@
 //! no alpha plane; RLE (3.1.9.2) of delta-folded R, G, B planes, or raw planes when smaller.
 
 const std = @import("std");
+/// Hot loops over our own frame data: checked in Debug (tests), unchecked in release builds.
+const kernel_safety = @import("builtin").mode == .debug;
 
 pub const header_cll_mask: u8 = 0x07;
 pub const header_cs: u8 = 0x08;
@@ -89,6 +91,7 @@ pub fn encodePlane(
     tmp: []u8,
     limit: usize,
 ) ?usize {
+    @setRuntimeSafety(kernel_safety);
     var o: usize = 0;
     for (0..h) |y| {
         const cur = pixels[y * stride ..][0 .. w * step];
@@ -106,6 +109,7 @@ pub fn encodePlane(
 
 /// tmp[x] = sign-folded (cur - prev) of channel ch.
 pub inline fn deltaRow(tmp: []u8, cur: []const u8, prev: []const u8, comptime step: usize, comptime ch: usize) void {
+    @setRuntimeSafety(kernel_safety);
     const V = 16;
     var x: usize = 0;
     if (step == 4) {
@@ -131,6 +135,7 @@ pub inline fn deltaRow(tmp: []u8, cur: []const u8, prev: []const u8, comptime st
 }
 
 pub inline fn runLength(e: []const u8, i: usize) usize {
+    @setRuntimeSafety(kernel_safety);
     const v = e[i];
     var j = i + 1;
     if (j >= e.len or e[j] != v) return 1;
@@ -147,6 +152,7 @@ pub inline fn runLength(e: []const u8, i: usize) usize {
 }
 
 pub fn rleRow(dst: []u8, e: []const u8) usize {
+    @setRuntimeSafety(kernel_safety);
     var o: usize = 0;
     var i: usize = 0;
     // The decoder's run value starts at 0 on every line, so leading zeros need no RAW byte.
