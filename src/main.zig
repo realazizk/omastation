@@ -249,6 +249,7 @@ pub fn main(init: std.process.Init) !void {
         break :blk auth.Store{};
     };
     log.info("{d} NLA user(s) configured", .{store.count});
+    if (store.skipped > 0) log.warn("{d} line(s) of {s} ignored: malformed, or more than {d} users", .{ store.skipped, cred_path, auth.max_users });
     if (o.no_pam) log.warn("--no-pam: delegated passwords are NOT checked with PAM", .{});
     if (o.allow_tls) log.warn("--insecure-allow-tls: TLS-only clients get in WITHOUT authentication", .{});
 
@@ -371,21 +372,32 @@ pub fn main(init: std.process.Init) !void {
             log.err("accept: {t}", .{err});
             continue;
         };
-        if (active_connections.load(.monotonic) >= max_connections) {
-            log.warn("{s}: refused, {d} connections in progress", .{ peer.addrText(), max_connections });
-            omastation.socket.close(peer.fd);
-            continue;
-        }
-        log.info("connection from {s}", .{peer.addrText()});
-        const job = gpa.create(Job) catch {
+        const slot = claimSlot(peer.fd) orelse blk: {
+            // Full: a connection that never authenticated (an idle TLS handshake, a slow-loris)
+            // gives way to the newcomer rather than locking the owner out for the 60 s deadline.
+            if (evictUnauthenticated(peer.addrText())) {
+                var waited: u32 = 0;
+                while (waited < 1000) : (waited += 20) {
+                    if (claimSlot(peer.fd)) |free| break :blk free;
+                    sleepMs(20);
+                }
+            }
+            log.warn("{s}: refused, {d} connections open already (the limit)", .{ peer.addrText(), max_connections });
             omastation.socket.close(peer.fd);
             continue;
         };
-        job.* = .{ .shared = &shared, .peer = peer };
+        log.info("connection from {s}", .{peer.addrText()});
+        const job = gpa.create(Job) catch {
+            slots[slot].release();
+            omastation.socket.close(peer.fd);
+            continue;
+        };
+        job.* = .{ .shared = &shared, .peer = peer, .slot = slot };
         _ = active_connections.fetchAdd(1, .monotonic);
         const th = std.Thread.spawn(.{}, serve, .{job}) catch |err| {
             log.err("{s}: no thread: {t}", .{ peer.addrText(), err });
             _ = active_connections.fetchSub(1, .monotonic);
+            slots[slot].release();
             omastation.socket.close(peer.fd);
             gpa.destroy(job);
             continue;
@@ -569,16 +581,64 @@ const Shared = struct {
 const Job = struct {
     shared: *const Shared,
     peer: omastation.socket.Peer,
+    slot: usize,
 };
+
+/// One per connection the listener allows at once.
+const Slot = struct {
+    fd: std.atomic.Value(c_int) = .init(-1),
+    since_ms: std.atomic.Value(i64) = .init(0),
+    authenticated: std.atomic.Value(bool) = .init(false),
+
+    fn release(s: *Slot) void {
+        s.authenticated.store(false, .release);
+        s.fd.store(-1, .release);
+    }
+};
+var slots: [max_connections]Slot = @splat(.{});
+
+fn claimSlot(fd: c_int) ?usize {
+    for (&slots, 0..) |*s, i| {
+        if (s.fd.cmpxchgStrong(-1, fd, .acq_rel, .acquire) == null) {
+            s.authenticated.store(false, .release);
+            s.since_ms.store(omastation.server.deadline.nowMs(), .release);
+            return i;
+        }
+    }
+    return null;
+}
+
+/// Shuts down the oldest connection that has not authenticated; its thread then ends and frees
+/// the slot. False when every connection is a real session.
+fn evictUnauthenticated(newcomer: []const u8) bool {
+    var oldest: ?*Slot = null;
+    for (&slots) |*s| {
+        if (s.fd.load(.acquire) < 0 or s.authenticated.load(.acquire)) continue;
+        if (oldest == null or s.since_ms.load(.acquire) < oldest.?.since_ms.load(.acquire)) oldest = s;
+    }
+    const s = oldest orelse return false;
+    const fd = s.fd.load(.acquire);
+    if (fd < 0) return false;
+    log.warn("{s}: all {d} slots taken; dropping an unauthenticated connection held {d} s", .{ newcomer, max_connections, @divTrunc(omastation.server.deadline.nowMs() - s.since_ms.load(.acquire), 1000) });
+    _ = c.shutdown(fd, c.SHUT_RDWR);
+    return true;
+}
+
+fn sleepMs(ms: u32) void {
+    var ts: c.struct_timespec = .{ .tv_sec = @intCast(ms / 1000), .tv_nsec = @intCast(@as(u64, ms % 1000) * std.time.ns_per_ms) };
+    _ = c.nanosleep(&ts, null);
+}
 
 fn serve(job: *Job) void {
     const sh = job.shared;
     defer {
+        slots[job.slot].release();
         sh.gpa.destroy(job);
         _ = active_connections.fetchSub(1, .monotonic);
     }
     var conn = omastation.server.Conn.init(sh.gpa, omastation.transport.Transport.init(job.peer.fd), sh.tls_ctx, sh.auth_cfg, sh.desktop_cfg, job.peer.addrText());
     defer conn.deinit();
+    conn.auth_done = &slots[job.slot].authenticated;
     conn.animate = sh.animate;
     conn.test_detail = sh.detail;
     conn.test_video = sh.video;
@@ -637,6 +697,7 @@ fn loadStore(arena: std.mem.Allocator, path: [:0]const u8) !auth.Store {
 
 fn passwd(arena: std.mem.Allocator, o: *const Options, cred_path: [:0]const u8, env: *std.process.Environ.Map) !void {
     const user: [:0]const u8 = o.user orelse try arena.dupeSentinel(u8, env.get("USER") orelse return fail("--user required"), 0);
+    if (!auth.Store.validUserName(user)) return fail("the account name must be 1 to 64 bytes without ':' or whitespace");
 
     var pw_buf: [512]u8 = undefined;
     defer std.crypto.secureZero(u8, &pw_buf);

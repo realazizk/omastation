@@ -22,14 +22,23 @@ pub const Entry = struct {
 pub const Store = struct {
     entries: [max_users]Entry = undefined,
     count: usize = 0,
+    /// Lines of the store that could not be used (malformed, or more than max_users).
+    skipped: usize = 0,
 
     pub fn add(s: *Store, user: []const u8, nt_hash: [16]u8) !void {
         if (s.count == max_users) return error.TooManyUsers;
-        if (user.len == 0 or user.len > 64) return error.BadUserName;
+        if (!validUserName(user)) return error.BadUserName;
         var e = Entry{ .user = undefined, .user_len = user.len, .nt_hash = nt_hash };
         @memcpy(e.user[0..user.len], user);
         s.entries[s.count] = e;
         s.count += 1;
+    }
+
+    /// What a store line can carry: 1..64 bytes, no ':' (the separator), no whitespace.
+    pub fn validUserName(user: []const u8) bool {
+        if (user.len == 0 or user.len > 64) return false;
+        for (user) |ch| if (ch == ':' or std.ascii.isWhitespace(ch) or ch == 0) return false;
+        return true;
     }
 
     /// Wipe the NT hashes: each is a password equivalent (MS-NLMP 3.3.2).
@@ -44,14 +53,24 @@ pub const Store = struct {
         while (it.next()) |raw| {
             const line = std.mem.trim(u8, raw, " \t\r");
             if (line.len == 0 or line[0] == '#') continue;
-            const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadCredentialsFile;
+            // One bad line must not take every other account down with it.
+            const colon = std.mem.indexOfScalar(u8, line, ':') orelse {
+                s.skipped += 1;
+                continue;
+            };
             const hex = line[colon + 1 ..];
-            if (hex.len != 32) return error.BadCredentialsFile;
             var h: [16]u8 = undefined;
             defer std.crypto.secureZero(u8, &h);
-            _ = std.fmt.hexToBytes(&h, hex) catch return error.BadCredentialsFile;
-            try s.add(line[0..colon], h);
+            if (hex.len != 32 or (std.fmt.hexToBytes(&h, hex) catch null) == null) {
+                s.skipped += 1;
+                continue;
+            }
+            s.add(line[0..colon], h) catch {
+                s.skipped += 1;
+                continue;
+            };
         }
+        if (s.count == 0 and s.skipped > 0) return error.BadCredentialsFile;
         return s;
     }
 

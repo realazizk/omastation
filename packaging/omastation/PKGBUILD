@@ -21,7 +21,7 @@ source=("omastation::git+file://${startdir%/packaging/omastation}"
 sha256sums=('SKIP'
             '7cc10fb232c639d1dbe1ea53633ec9dd88895209e15b204b65b389d181cd1dc3'
             'd0ed0842b1fa53e25c02a5c38737b90dab54f75a6b8bb1fa0eacf73f2abbd151'
-            'fd5491050c108ac08876e427c1e7756da28b8c82d6cea0ebc823bd789dce399d'
+            'cb951c13ae95338773817f954f47ae5ba4f1fb3a4ccea4d1e78d6db10e94fe1d'
             '66665335d168f38c17590dae7d382fc578fe19eb8b9d347e1f46cf0674cdcaf9'
             'dec64679a71d18bde0e212669121ca6844585f9856b5272194a0303579386d05'
             '2ddc6cda34d59199aca17a251dd8cb3e9991cdab2a1bcff6395c14d89a455900')

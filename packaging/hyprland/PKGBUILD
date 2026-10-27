@@ -1,6 +1,7 @@
-# Arch's hyprland PKGBUILD (0.56.2-2) plus omastation's patch: the cursor capture returns the
+# Arch's hyprland PKGBUILD (0.56.2-4) plus omastation's patch: the cursor capture returns the
 # real cursor image, so RDP clients draw the pointer themselves. Replaces the installed
-# hyprland (makepkg -si); Arch's next hyprland release replaces it again.
+# hyprland (makepkg -si); Arch's next hyprland release replaces it again. Only the hyprland
+# package is built: Arch ships hyprpm separately, and this package leaves its files out.
 #
 # Maintainer: Caleb Maclennan <caleb@alerque.com>
 # Contributor: ThatOneCalculator <kainoa@t1c.dev>
@@ -9,7 +10,7 @@
 
 pkgname=hyprland
 pkgver=0.56.2
-pkgrel=2.1
+pkgrel=4.1
 pkgdesc='a highly customizable dynamic tiling Wayland compositor (with omastation'"'"'s cursor capture patch)'
 arch=(x86_64 aarch64)
 url="https://github.com/hyprwm/${pkgname^}"
@@ -26,7 +27,6 @@ depends=(cairo # libcairo.so
          hyprland-guiutils
          hyprlang libhyprlang.so
          hyprutils libhyprutils.so
-         hyprwayland-scanner
          hyprwire libhyprwire.so
          lcms2 liblcms2.so
          libdrm # libdrm.so
@@ -61,16 +61,12 @@ depends=(cairo # libcairo.so
 makedepends=(cmake
              glaze
              hyprland-protocols
+             hyprwayland-scanner
              meson
              ninja
              xorgproto)
-optdepends=('cmake: to build and install plugins using hyprpm'
-            'cpio: to build and install plugins using hyprpm'
-            'glaze: to build and install plugins using hyprpm'
-            'hyprland-protocols: to build and install plugins using hyprpm'
+optdepends=('hyprpm: build and install plugins'
             'hyprshutdown: clean logout and shutdown helper'
-            'meson: to build and install plugins using hyprpm'
-            'uwsm: an advanced way to start desktop compositors as systemd units'
             'xdg-desktop-portal-hyprland: xdg-desktop-portal backend for hyprland')
 provides=(wayland-compositor)
 _archive="${pkgname^}-$pkgver"
@@ -96,5 +92,6 @@ package() {
 	cd "$_archive"
 	make DESTDIR="$pkgdir" install
 	rm -fv "$pkgdir/usr/include/hyprland/src/version.h.in"
+	find $pkgdir -name '*hyprpm*' -delete
 	install -Dm0644 -t "$pkgdir/usr/share/licenses/$pkgname/" LICENSE
 }
