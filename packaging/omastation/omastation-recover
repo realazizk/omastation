@@ -124,6 +124,9 @@ if [ -s "$plan" ]; then
 				sleep 0.05
 				i=$((i + 1))
 			done
+			# Clients (the lock screen) get their wl_output a little after Hyprland reports the
+			# monitor: removing the RDP output before that leaves the lock screen without a surface.
+			sleep 0.5
 			;;
 		?*) hyprctl "${step%% *}" "${step#* }" >/dev/null 2>&1 ;;
 		esac

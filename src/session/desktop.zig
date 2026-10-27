@@ -1253,6 +1253,12 @@ pub const Desktop = struct {
         };
     }
 
+    /// Hyprland reports a monitor enabled before every client has its wl_output: the lock screen
+    /// (omarchy-shell) that sees the RDP output go before the physical one arrives is left with a
+    /// placeholder screen and never draws a lock surface on the monitor that then appears
+    /// (Hyprland shows "the lockscreen app died"). Give clients this long to catch up.
+    const monitor_on_settle_ms = 500;
+
     fn waitMonitorOn(d: *Desktop, name: []const u8) void {
         var waited: u32 = 0;
         while (waited < 2000) : (waited += 50) {
@@ -1260,7 +1266,11 @@ pub const Desktop = struct {
             defer arena.deinit();
             const ms = hypr.monitors(&d.ipc, arena.allocator()) catch return;
             for (ms) |m| {
-                if (std.mem.eql(u8, m.name, name) and !m.disabled) return;
+                if (std.mem.eql(u8, m.name, name) and !m.disabled) {
+                    log.info("{s} is back after {d} ms; {d} ms for clients to see it", .{ name, waited, monitor_on_settle_ms });
+                    sleepMs(monitor_on_settle_ms);
+                    return;
+                }
             }
             sleepMs(50);
         }

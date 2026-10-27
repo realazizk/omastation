@@ -171,8 +171,8 @@ pub fn parseClientPdu(payload: []const u8) Error!ClientPdu {
     const first = try r.byte();
     switch (domainPduType(first)) {
         .erect_domain_request => {
-            _ = try per.readInteger(&r); // subHeight
-            _ = try per.readInteger(&r); // subInterval
+            // subHeight and subInterval are ignored (MS-RDPBCGR 3.3.5.3.5). rdesktop writes them as
+            // plain 16-bit integers (00 01 00 01) rather than PER, which Windows accepts.
             return .erect_domain_request;
         },
         .attach_user_request => return .attach_user_request,

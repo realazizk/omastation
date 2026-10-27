@@ -125,7 +125,9 @@ pub const ClientData = struct {
                 15, 16, 24, 32 => d.high_color_depth,
                 else => 16,
             };
-            if (want == 24 or d.early_caps.want_32bpp_session) want = 32;
+            // 24 bpp stays 24 unless the client asks for a 32 bpp session, as Windows does (2.2.1.3.2):
+            // rdesktop and other clients that ask for 24 cannot decode every planar variant.
+            if (d.early_caps.want_32bpp_session) want = 32;
             const steps = [_]struct { bpp: u16, bit: u16 }{
                 .{ .bpp = 32, .bit = 0x0008 }, // RNS_UD_32BPP_SUPPORT
                 .{ .bpp = 24, .bit = 0x0001 }, // RNS_UD_24BPP_SUPPORT
@@ -476,11 +478,11 @@ test "session color depth: 32 with the graphics pipeline, else the request stepp
     d.supported_color_depths = 0x0001 | 0x0002;
     d.high_color_depth = 24;
     try std.testing.expectEqual(@as(u16, 24), d.sessionColorDepth());
-    // Without the pipeline: 24 promoted to 32, 16 stays 16, WANT_32BPP gives 32.
+    // Without the pipeline: 24 stays 24 (as Windows), 16 stays 16, WANT_32BPP gives 32.
     d.early_caps.support_dynvc_gfx_protocol = false;
     d.supported_color_depths = 0x000F;
     d.high_color_depth = 24;
-    try std.testing.expectEqual(@as(u16, 32), d.sessionColorDepth());
+    try std.testing.expectEqual(@as(u16, 24), d.sessionColorDepth());
     d.high_color_depth = 16;
     try std.testing.expectEqual(@as(u16, 16), d.sessionColorDepth());
     d.early_caps.want_32bpp_session = true;

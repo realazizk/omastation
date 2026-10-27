@@ -103,6 +103,9 @@ pub const Conn = struct {
     auth_cfg: *const AuthConfig,
     /// Authenticated user (ASCII, from the verifier store), set after NLA.
     user: ?[]const u8 = null,
+    /// Set once the client has proven itself (NLA, or a TLS-only session established): the
+    /// listener evicts connections still without it when it runs out of slots.
+    auth_done: ?*std.atomic.Value(bool) = null,
     /// PDUs being built; `flush` moves them to `sendq`.
     out: std.ArrayList(u8) = .empty,
     sendq: sendq_mod.SendQueue = .{},
@@ -622,6 +625,7 @@ pub const Conn = struct {
         }
         self.flight.note(.nla, &.{});
         log.info("{s}: NLA ok, user {s}", .{ self.peer, self.user.? });
+        if (self.auth_done) |f| f.store(true, .release);
     }
 
     pub fn mcsConnect(self: *Conn) Error!void {
@@ -1225,6 +1229,7 @@ pub const Conn = struct {
                     try rdp.writeFontMap(&bw);
                     try self.queueMcs(mcs.io_channel_id, body.items);
                     self.established = true;
+                    if (self.auth_done) |f| f.store(true, .release);
                     self.flight.note(.established, &.{});
                     try session_info.onEstablished(self); // flushes
                 } else {
