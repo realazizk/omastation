@@ -1,0 +1,27 @@
+From: realazizk <azizk@tuta.com>
+Date: Wed, 28 Oct 2026 13:42:37 +0100
+Subject: [PATCH 3/4] screenshare: don't copy a pending cursor frame through a
+ disabled monitor
+
+Backport of hyprwm/Hyprland#16533 (8010b4e). A pending cursor capture frame
+kept the monitor it was captured on; after the monitor was removed, the next
+cursor change (or a capture on the gone output) rendered into the capture
+buffer through it: SIGSEGV in beginFullFakeRender() from
+CCursorshareSession::copy(). copy() now refuses a disabled monitor.
+---
+ src/managers/screenshare/CursorshareSession.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/managers/screenshare/CursorshareSession.cpp b/src/managers/screenshare/CursorshareSession.cpp
+index 1bd57ca..87b4cd8 100644
+--- a/src/managers/screenshare/CursorshareSession.cpp
++++ b/src/managers/screenshare/CursorshareSession.cpp
+@@ -200,7 +200,7 @@ static bool copyThemeCursorToShm(SP<IHLBuffer> buffer, wl_client* client, const
+ }
+ 
+ bool CCursorshareSession::copy() {
+-    if (!m_pendingFrame.callback || !m_pendingFrame.monitor || !m_pendingFrame.callback || !m_pendingFrame.sourceBoxCallback)
++    if (!m_pendingFrame.callback || !m_pendingFrame.monitor || !m_pendingFrame.monitor->m_enabled || !m_pendingFrame.callback || !m_pendingFrame.sourceBoxCallback)
+         return false;
+ 
+     // FIXME: this doesn't really make sense but just to be safe

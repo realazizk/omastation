@@ -37,7 +37,7 @@ pub fn planEnter(arena: std.mem.Allocator, monitors: []const hypr.MonitorState, 
     try steps.append(arena, .{ .cmd = try arena.dupe(u8, try hypr.formatMonitorRule(&buf, rdp_output_name, out.width, out.height, out.refresh, rdpX(monitors), 0, out.scale, 0)), .critical = true });
     if (!have_rdp) try steps.append(arena, .{ .cmd = try std.fmt.allocPrint(arena, "output create headless {s}", .{rdp_output_name}), .critical = true });
     for (workspaces) |w| {
-        if (!movable(monitors, w)) continue;
+        if (!enterMovable(monitors, w)) continue;
         try steps.append(arena, .{ .cmd = try arena.dupe(u8, try hypr.formatWorkspaceMove(&buf, w, rdp_output_name)), .critical = false });
     }
     for (monitors) |m| {
@@ -177,7 +177,7 @@ pub fn planEnterOutputs(arena: std.mem.Allocator, monitors: []const hypr.Monitor
     var buf: [1400]u8 = undefined;
     for ([_]bool{ false, true }) |active_pass| {
         for (workspaces) |w| {
-            if (!movable(monitors, w) or isActiveOn(monitors, w) != active_pass) continue;
+            if (!enterMovable(monitors, w) or isActiveOn(monitors, w) != active_pass) continue;
             const t = targetOf(monitors, targets, w.monitor) orelse continue;
             try steps.append(arena, .{ .cmd = try arena.dupe(u8, try hypr.formatWorkspaceMove(&buf, w, plan.outputs[t].name())), .critical = false });
         }
@@ -390,6 +390,17 @@ pub fn planDeviceBindings(arena: std.mem.Allocator, plan: *const multimon.Sessio
 /// Normal workspaces with windows on an enabled physical monitor (Hyprland drops empty ones).
 fn movable(monitors: []const hypr.MonitorState, w: hypr.WorkspaceState) bool {
     return !w.isSpecial() and w.windows > 0 and onEnabledPhysical(monitors, w.monitor);
+}
+
+/// What enter moves: `movable` workspaces and each lit physical monitor's shown one, even empty.
+/// Left on the monitor as it goes dark, that one is what Hyprland remembers for the monitor and
+/// takes back when it comes on again; from an RDP output that is not focused (a multi-monitor
+/// session) it takes it slid out and shows it without sliding it in: every window drawn a
+/// monitor's width aside, at the desk and, swapped onto RDP-1 by the next enter's final focus, in
+/// the session. Moved, it reaches RDP-1 by a move and a workspace switch.
+fn enterMovable(monitors: []const hypr.MonitorState, w: hypr.WorkspaceState) bool {
+    if (movable(monitors, w)) return true;
+    return !w.isSpecial() and onEnabledPhysical(monitors, w.monitor) and isActiveOn(monitors, w);
 }
 
 /// A desk look: physical monitors back as captured while the session stays connected.
@@ -611,6 +622,59 @@ test "enter: create, move every workspace, then darken physical monitors" {
     try std.testing.expect(indexOf(steps, "\"DP-1\", disabled = true") != null);
     // A monitor that was already off is left alone.
     try std.testing.expect(indexOf(steps, "HDMI-A-1") == null);
+}
+
+/// The desk after a clean disconnect with every window closed: workspace 1 shown, empty.
+fn emptyDeskFixture() [1]hypr.MonitorState {
+    return .{.{ .name = "Virtual-1", .width = 1920, .height = 1080, .refresh = 75, .x = 0, .y = 0, .scale = 1, .transform = 0, .disabled = false, .workspace = "1", .workspace_id = 1, .focused = true }};
+}
+
+fn emptyDeskWorkspaces() [2]hypr.WorkspaceState {
+    return .{
+        .{ .id = 1, .name = "1", .monitor = "Virtual-1", .windows = 0 },
+        .{ .id = 5, .name = "5", .monitor = "Virtual-1", .windows = 0 }, // not shown: Hyprland drops it
+    };
+}
+
+test "enter: the desk's workspace moves to RDP-1 even when empty, before its monitor goes dark" {
+    // Left on its monitor as it went dark, an empty workspace comes back wrong at the next session.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const mons = emptyDeskFixture();
+    const wss = emptyDeskWorkspaces();
+    const steps = try planEnter(arena.allocator(), &mons, &wss, .{ .width = 1600, .height = 900, .scale = 1 });
+    try std.testing.expectEqual(@as(usize, 6), steps.len);
+    try std.testing.expectEqualStrings("output create headless RDP-1", steps[1].cmd);
+    try std.testing.expectEqualStrings("eval hl.dispatch(hl.dsp.workspace.move({ workspace = \"1\", monitor = \"RDP-1\" }))", steps[2].cmd);
+    try std.testing.expect(!steps[2].critical);
+    try std.testing.expectEqualStrings("eval hl.monitor({ output = \"Virtual-1\", disabled = true })", steps[3].cmd);
+    try std.testing.expectEqualStrings("eval hl.dispatch(hl.dsp.focus({ monitor = \"RDP-1\" }))", steps[4].cmd);
+    try std.testing.expectEqualStrings("eval hl.dispatch(hl.dsp.focus({ workspace = \"1\", on_current_monitor = true }))", steps[5].cmd);
+    // An empty workspace that is not shown is still left alone.
+    try std.testing.expect(indexOf(steps, "\"5\"") == null);
+    // A shown special workspace stays with its monitor.
+    var special = mons;
+    special[0].workspace = "special:magic";
+    special[0].workspace_id = -98;
+    const sws = [_]hypr.WorkspaceState{.{ .id = -98, .name = "special:magic", .monitor = "Virtual-1", .windows = 0 }};
+    try std.testing.expect(indexOf(try planEnter(arena.allocator(), &special, &sws, .{ .width = 1600, .height = 900, .scale = 1 }), "workspace.move") == null);
+}
+
+test "enter with several outputs: the desk's empty workspace moves to its output too" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const mons = emptyDeskFixture();
+    const wss = emptyDeskWorkspaces();
+    var l: multimon.Layout = .{ .count = 2 };
+    l.monitors[0] = .{ .left = 0, .top = 0, .width = 1600, .height = 900, .primary = true };
+    l.monitors[1] = .{ .left = 1600, .top = 0, .width = 1280, .height = 1024 };
+    const plan = try multimon.planSession(&l, .{ .base_x = rdpBaseX(&mons) });
+    const steps = try planEnterOutputs(arena.allocator(), &mons, &wss, &plan);
+    const move = indexOf(steps, "workspace.move({ workspace = \"1\", monitor = \"RDP-1\" })").?;
+    try std.testing.expect(move < indexOf(steps, "\"Virtual-1\", disabled = true").?);
+    try std.testing.expect(indexOf(steps, "\"5\"") == null);
+    try std.testing.expectEqualStrings("eval hl.dispatch(hl.dsp.focus({ workspace = \"1\", on_current_monitor = true }))", steps[steps.len - 1].cmd);
+    try std.testing.expectEqualStrings("eval hl.dispatch(hl.dsp.focus({ monitor = \"RDP-1\" }))", steps[steps.len - 2].cmd);
 }
 
 test "restore: exact modes with disabled=false, workspaces back (active last), RDP output removed last" {

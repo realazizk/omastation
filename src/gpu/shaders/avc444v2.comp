@@ -1,0 +1,92 @@
+#version 450
+// BGRX → the two AVC444 v2 views (MS-RDPEGFX 3.3.8.3.2) for the H.264 encoder's input surfaces
+// (src/gpu/nv12.zig), bit-exact with avc444.toNv12(.v2): the matrix and rounding of nv12.comp,
+// views of the coded size with the source's last column and row repeated. Main: Y444 and the
+// rounded 2x2 chroma averages. Auxiliary: Y = U444 / V444 at odd columns (left / right half),
+// U = U444 / V444 at (4x, 2y+1), V = the same at (4x+2, 2y+1). One invocation per 4x2 pixels (two
+// main chroma samples, one auxiliary U/V pair), a workgroup per 16x16 block; only blocks of
+// source blocks `blocks` flags are written (columns past the picture follow its last block).
+// Rebuild: ./build.sh.
+
+layout(local_size_x = 4, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Blocks { uint blocks[]; };
+layout(set = 0, binding = 2, r8) uniform writeonly image2D main_y;
+layout(set = 0, binding = 3, rg8) uniform writeonly image2D main_uv;
+layout(set = 0, binding = 4, r8) uniform writeonly image2D aux_y;
+layout(set = 0, binding = 5, rg8) uniform writeonly image2D aux_uv;
+
+layout(push_constant) uniform Params {
+    uint width;      // source picture
+    uint height;
+    uint src_offset; // 32-bit words
+    uint src_stride;
+    uint blocks_x;   // source blocks
+    uint blocks_y;
+    uint all;        // 1: every block
+    uint view_w;     // the views' luma size (multiple of 32 and 16)
+} p;
+
+const int k_yr = 13933;
+const int k_yg = 46871;
+const int k_yb = 4732;
+const int k_ur = -7510;
+const int k_ug = -25258;
+const int k_ub = 32768;
+const int k_vr = 32768;
+const int k_vg = -29766;
+const int k_vb = -3002;
+
+int fixv(int v) {
+    return clamp((v + 32768) >> 16, 0, 255);
+}
+
+float n8(int v) {
+    return float(v) / 255.0;
+}
+
+void main() {
+    uvec2 b = gl_WorkGroupID.xy;
+    uint bi = min(b.y, p.blocks_y - 1u) * p.blocks_x + min(b.x, p.blocks_x - 1u);
+    if (p.all == 0u && blocks[bi] == 0u) return;
+    uint x = gl_GlobalInvocationID.x * 4u;
+    uint y = gl_GlobalInvocationID.y * 2u;
+    int Y[2][4];
+    int U[2][4];
+    int V[2][4];
+    for (uint dy = 0u; dy < 2u; dy++) {
+        uint sy = min(y + dy, p.height - 1u);
+        for (uint dx = 0u; dx < 4u; dx++) {
+            uint sx = min(x + dx, p.width - 1u);
+            uint px = src[p.src_offset + sy * p.src_stride + sx];
+            int bl = int(px & 0xFFu);
+            int g = int((px >> 8) & 0xFFu);
+            int r = int((px >> 16) & 0xFFu);
+            Y[dy][dx] = fixv(k_yr * r + k_yg * g + k_yb * bl);
+            U[dy][dx] = fixv(k_ur * r + k_ug * g + k_ub * bl + (128 << 16));
+            V[dy][dx] = fixv(k_vr * r + k_vg * g + k_vb * bl + (128 << 16));
+        }
+    }
+    ivec2 o = ivec2(x, y);
+    for (int dy = 0; dy < 2; dy++)
+        for (int dx = 0; dx < 4; dx++)
+            imageStore(main_y, o + ivec2(dx, dy), vec4(n8(Y[dy][dx])));
+    for (int q = 0; q < 2; q++) {
+        int su = U[0][2 * q] + U[0][2 * q + 1] + U[1][2 * q] + U[1][2 * q + 1];
+        int sv = V[0][2 * q] + V[0][2 * q + 1] + V[1][2 * q] + V[1][2 * q + 1];
+        imageStore(main_uv, ivec2(x / 2u + uint(q), y / 2u), vec4(n8((su + 2) >> 2), n8((sv + 2) >> 2), 0.0, 0.0));
+    }
+    int half_w = int(p.view_w / 2u);
+    for (int dy = 0; dy < 2; dy++) {
+        ivec2 a = ivec2(x / 2u, y + uint(dy));
+        imageStore(aux_y, a, vec4(n8(U[dy][1])));
+        imageStore(aux_y, a + ivec2(1, 0), vec4(n8(U[dy][3])));
+        imageStore(aux_y, a + ivec2(half_w, 0), vec4(n8(V[dy][1])));
+        imageStore(aux_y, a + ivec2(half_w + 1, 0), vec4(n8(V[dy][3])));
+    }
+    int quarter_w = int(p.view_w / 4u);
+    ivec2 c = ivec2(x / 4u, y / 2u);
+    imageStore(aux_uv, c, vec4(n8(U[1][0]), n8(U[1][2]), 0.0, 0.0));
+    imageStore(aux_uv, c + ivec2(quarter_w, 0), vec4(n8(V[1][0]), n8(V[1][2]), 0.0, 0.0));
+}

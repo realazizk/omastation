@@ -29,6 +29,7 @@ pub const codec = @import("codec/codec.zig");
 pub const input = @import("input/input.zig");
 pub const sec = @import("sec/sec.zig");
 pub const wl = @import("wl/wl.zig");
+pub const gpu = @import("gpu/gpu.zig");
 pub const audio = @import("audio/audio.zig");
 pub const channel = @import("channel/channel.zig");
 pub const drives = @import("drives/drives.zig");

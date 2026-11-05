@@ -80,6 +80,11 @@ const usage =
     \\                         none: don't load it)
     \\  --capture-backend B    how the desktop is captured: ext (ext-image-copy-capture,
     \\                         default) or wlr (wlr-screencopy; testing)
+    \\  --no-gpu-capture       capture into shared memory and find changes on the CPU.
+    \\                         By default the compositor renders frames into GPU buffers
+    \\                         and changes are found on the GPU (Vulkan), no copy of
+    \\                         every frame to RAM; an output the GPU path cannot serve
+    \\                         falls back to shared memory by itself
     \\  --cursor MODE          who draws the pointer: auto (the client, once the
     \\                         compositor's cursor capture works; default), client
     \\                         (always), paint (painted into the frames)
@@ -89,6 +94,10 @@ const usage =
     \\  --test-scene NAME      without --desktop: play a desktop scene over and over:
     \\                         scroll, window, video_small, video_full, scroll_busy
     \\                         (picture quality; needs a desktop of at least 1920x1200)
+    \\  --test-capture OUTPUT  DEVELOPMENT ONLY, without --desktop: serve OUTPUT of the
+    \\                         compositor in WAYLAND_DISPLAY (e.g. a nested Hyprland's
+    \\                         headless output) read-only: no lock, no helper or fence, no
+    \\                         plugin, no audio, no input
     \\  --test-detail          without --desktop: fine noise over the test pattern, as
     \\                         photos and small text are to codecs (load test)
     \\  --echo MS              open the ECHO dynamic channel and measure its round
@@ -103,6 +112,10 @@ const usage =
     \\                         /dev/dri/renderD129 or just renderD129 (default: the
     \\                         first node that can; on a hybrid laptop with an NVIDIA
     \\                         dGPU that is usually the iGPU)
+    \\  --h264-encoder E       who encodes H.264: auto (VA-API on the GPU, else OpenH264
+    \\                         in software when libopenh264 is installed; default),
+    \\                         vaapi (the GPU only) or software (OpenH264 only; AVC420:
+    \\                         AVC444 needs VA-API)
     \\  --no-gfx               do not offer the graphics pipeline (RDPGFX): bitmap
     \\                         updates and surface commands only (testing)
     \\  --lossy-motion MODE    CPU lossy codecs (progressive, RemoteFX, NSCodec) for
@@ -174,6 +187,8 @@ const Options = struct {
     alt_drag: omastation.session.altdrag.Mode = .auto,
     hyprland_plugin: ?[:0]const u8 = omastation.session.plugin.default_path,
     capture_backend: omastation.wl.capture.Backend = .ext,
+    gpu_capture: bool = true,
+    test_capture: ?[]const u8 = null,
     cursor: omastation.session.desktop.CursorMode = .auto,
     animate: bool = false,
     detail: bool = false,
@@ -191,6 +206,11 @@ pub fn main(init: std.process.Init) !void {
     // ReleaseSafe's process allocator is the leak-checking SafeAllocator, which never reuses
     // memory and checks every call; a server encoding frames all day wants libc's.
     const gpa = if (builtin.mode == .debug) init.gpa else std.heap.c_allocator;
+    // glibc gives threads arenas of their own, up to 8 per core, and keeps in each what was
+    // freed there: with a thread per connection (and its codec threads) idle RSS grew with
+    // every session while nothing leaked. Two arenas, set before any thread starts, keep it
+    // flat, and encoding is no slower with them.
+    if (builtin.mode != .debug and builtin.abi.isGnu()) _ = c.mallopt(c.M_ARENA_MAX, 2);
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
@@ -276,6 +296,16 @@ pub fn main(init: std.process.Init) !void {
 
     var seat: omastation.server.seat.Seat = .{};
     var desktop_cfg: ?omastation.server.conn.DesktopConfig = null;
+    if (o.desktop and o.test_capture != null) return fail("--test-capture is for development without --desktop");
+    if (o.test_capture) |name| log.warn("DEVELOPMENT: serving output {s} of WAYLAND_DISPLAY read-only (--test-capture){s}", .{ name, if (o.gpu_capture) "" else " without GPU capture" });
+    if (o.features.graphics.vaapi_device) |node| if (c.access(node.ptr, c.R_OK | c.W_OK) != 0) {
+        const why = std.mem.span(c.strerror(std.c._errno().*));
+        log.warn("--gpu {s}: {s}: {s}", .{ node, why, switch (o.features.graphics.h264_encoder) {
+            .auto => "no VA-API H.264 (H.264 in software when OpenH264 is installed)",
+            .vaapi => "no VA-API H.264, and with --h264-encoder vaapi no H.264",
+            .software => "unused (--h264-encoder software)",
+        } });
+    };
     if (o.desktop) {
         const ipc = omastation.session.hypr.Ipc.fromEnv(init.environ_map) catch
             return fail("--desktop: not inside a Hyprland session (HYPRLAND_INSTANCE_SIGNATURE unset)");
@@ -315,6 +345,7 @@ pub fn main(init: std.process.Init) !void {
             .console_state_path = console_state,
             .capture_backend = o.capture_backend,
             .cursor = o.cursor,
+            .gpu_capture = o.gpu_capture,
         };
         if (o.allow_tls) log.warn("--desktop ignores --insecure-allow-tls: desktop sessions require NLA", .{});
         // Client drives: mounted in the runtime directory, linked from the home directory.
@@ -360,6 +391,8 @@ pub fn main(init: std.process.Init) !void {
         .detail = o.detail and desktop_cfg == null,
         .video = if (desktop_cfg == null) o.video else null,
         .scene = if (desktop_cfg == null) o.scene else null,
+        .test_capture = if (desktop_cfg == null) o.test_capture else null,
+        .gpu_capture = o.gpu_capture,
         .features = o.features,
         .seat = &seat,
         .flight = if (flight_cfg) |*f| f else null,
@@ -475,6 +508,14 @@ fn parseOptions(arena: std.mem.Allocator, args: []const [:0]const u8, first: usi
         } else if (std.mem.eql(u8, a, "--cursor")) {
             o.cursor = std.meta.stringToEnum(omastation.session.desktop.CursorMode, val) orelse return fail("bad --cursor");
             i += 1;
+        } else if (std.mem.eql(u8, a, "--gpu-capture")) {
+            o.gpu_capture = true;
+        } else if (std.mem.eql(u8, a, "--no-gpu-capture")) {
+            o.gpu_capture = false;
+        } else if (std.mem.eql(u8, a, "--test-capture")) {
+            if (val.len == 0) return fail("bad --test-capture");
+            o.test_capture = val;
+            i += 1;
         } else if (std.mem.eql(u8, a, "--test-animate")) {
             o.animate = true;
         } else if (std.mem.eql(u8, a, "--test-scene")) {
@@ -503,6 +544,9 @@ fn parseOptions(arena: std.mem.Allocator, args: []const [:0]const u8, first: usi
         } else if (std.mem.eql(u8, a, "--gpu")) {
             if (val.len == 0) return fail("bad --gpu");
             o.features.graphics.vaapi_device = if (std.mem.startsWith(u8, val, "/")) val else try std.fmt.allocPrintSentinel(arena, "/dev/dri/{s}", .{val}, 0);
+            i += 1;
+        } else if (std.mem.eql(u8, a, "--h264-encoder")) {
+            o.features.graphics.h264_encoder = std.meta.stringToEnum(omastation.codec.h264.Backend, val) orelse return fail("bad --h264-encoder");
             i += 1;
         } else if (std.mem.eql(u8, a, "--no-gfx")) {
             o.features.graphics.rdpgfx = false;
@@ -571,6 +615,9 @@ const Shared = struct {
     detail: bool,
     video: ?[2]u16,
     scene: ?omastation.server.scene.Kind,
+    /// --test-capture: an output of WAYLAND_DISPLAY served read-only (development).
+    test_capture: ?[]const u8,
+    gpu_capture: bool,
     features: omastation.server.features.Options,
     /// Session state shared by all connections (auto-reconnect cookie), test-pattern mode too.
     seat: *omastation.server.seat.Seat,
@@ -629,7 +676,17 @@ fn sleepMs(ms: u32) void {
     _ = c.nanosleep(&ts, null);
 }
 
+/// glibc keeps what was freed in its arenas, so idle RSS still creeps a little per session: the
+/// end of a connection gives it back to the system (see mallopt in main).
+fn trimHeap() void {
+    if (builtin.mode == .debug or !builtin.abi.isGnu()) return;
+    const t0 = omastation.server.conn.nowNs();
+    const released = c.malloc_trim(0) != 0;
+    log.debug("connection over: heap trimmed in {d} us{s}", .{ (omastation.server.conn.nowNs() -| t0) / std.time.ns_per_us, if (released) "" else " (nothing to give back)" });
+}
+
 fn serve(job: *Job) void {
+    defer trimHeap(); // last, once the connection's memory is freed
     const sh = job.shared;
     defer {
         slots[job.slot].release();
@@ -644,6 +701,9 @@ fn serve(job: *Job) void {
     conn.test_video = sh.video;
     var player: omastation.server.scene.Player = .{ .kind = sh.scene orelse .scroll };
     if (sh.scene != null) conn.test_source = .{ .ctx = &player, .pump = omastation.server.scene.Player.pump };
+    var test_cap: omastation.server.test_capture.TestCapture = .{ .gpa = sh.gpa, .output_name = sh.test_capture orelse "", .gpu = sh.gpu_capture };
+    defer test_cap.deinit();
+    if (sh.test_capture != null) conn.test_source = .{ .ctx = &test_cap, .pump = omastation.server.test_capture.TestCapture.pump };
     conn.vc.opts = sh.features;
     conn.seat = sh.seat;
     if (sh.flight) |cfg| conn.flight.start(sh.gpa, cfg.capacity, cfg) catch
@@ -799,6 +859,16 @@ test "--gpu takes a render node path or its name under /dev/dri, and --codecs al
     try std.testing.expect(o.features.graphics.avc420);
 }
 
+test "--h264-encoder picks who codes H.264, and --codecs all keeps it" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var o = Options{};
+    try std.testing.expectEqual(omastation.codec.h264.Backend.auto, o.features.graphics.h264_encoder);
+    try std.testing.expectEqual(Parsed.run, try parseOptions(arena_state.allocator(), &.{ "omastation", "--h264-encoder", "software", "--codecs", "all" }, 1, &o));
+    try std.testing.expectEqual(omastation.codec.h264.Backend.software, o.features.graphics.h264_encoder);
+    try std.testing.expectError(error.InvalidArguments, parseOptions(arena_state.allocator(), &.{ "omastation", "--h264-encoder", "nvenc" }, 1, &o));
+}
+
 test "every option the usage text shows with a value consumes it" {
     // An option in the usage text without a sample here fails the test.
     const samples = [_]struct { []const u8, [:0]const u8 }{
@@ -812,6 +882,7 @@ test "every option the usage text shows with a value consumes it" {
         .{ "--udp-version", "3" },          .{ "--mic-buffer-max", "300" },        .{ "--touch", "auto" },
         .{ "--log-level", "info" },         .{ "--flight-record", "off" },         .{ "--test-video", "640x360" },
         .{ "--test-scene", "scroll_busy" }, .{ "--cursor", "auto" },               .{ "--gpu", "renderD129" },
+        .{ "--h264-encoder", "software" },  .{ "--test-capture", "RDP-1" },
     };
     var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_state.deinit();

@@ -40,6 +40,10 @@ pub const Picture = struct {
     stride: usize,
     width: u32,
     height: u32,
+    /// Called on a rect before its pixels are read (GPU capture brings lagging tiles in).
+    fresh: ?Fresh = null,
+
+    pub const Fresh = struct { ctx: *anyopaque, func: *const fn (ctx: *anyopaque, r: Rect16) void };
 };
 
 pub const Event = enum { started, ended };
@@ -331,6 +335,7 @@ pub const Detector = struct {
         };
         const wb = withinBounds(t, c);
         const away = !wb.within and d.hotPixels(t) * 100 <= t.area() * min_heatmap_overlap;
+        if (!away) if (pic.fresh) |f| f.func(f.ctx, c.r16());
         if (away or !naturalImage(pic, c)) {
             d.invalid_hints += 1;
             if (d.invalid_hints > max_invalid_hints_inactive) d.forget();

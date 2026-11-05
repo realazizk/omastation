@@ -1,0 +1,83 @@
+#version 450
+// Change detection on the GPU (src/gpu/tilediff.zig), the twin of encoder.zig's diff: one
+// workgroup per 64x64 tile compares the captured frame with the previously processed one (all
+// 32 bits of each pixel), writes the exact bounding box of the changed pixels, and copies a
+// changed tile into the host-visible staging buffer at its place in the frame (row stride =
+// width), unless `mask` says to skip it (lazy readback: tiles H.264 codes from the GPU).
+// mode 0: that; 1: copy every tile, each reported wholly changed; 2: copy only the tiles `mask`
+// flags (bringing lagging shadow tiles in; no compare, no boxes).
+// Rebuild: ./build.sh (glslc); the SPIR-V is committed.
+
+layout(local_size_x = 64, local_size_y = 4) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Cur { uint cur[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Prev { uint prev[]; };
+// Per tile, row-major: (left, top, right, bottom) relative to the tile; right == 0: unchanged.
+layout(std430, set = 0, binding = 2) writeonly buffer Boxes { uvec4 boxes[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Staging { uint staging[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Mask { uint mask[]; };
+
+// Offsets and strides in 32-bit words.
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint cur_offset;
+    uint cur_stride;
+    uint prev_offset;
+    uint prev_stride;
+    uint tiles_x;
+    uint mode;
+} p;
+
+shared uint s_left;
+shared uint s_top;
+shared uint s_right;
+shared uint s_bottom;
+
+void main() {
+    uint x0 = gl_WorkGroupID.x * 64u;
+    uint y0 = gl_WorkGroupID.y * 64u;
+    uint tw = min(64u, p.width - x0);
+    uint th = min(64u, p.height - y0);
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    if (lx == 0u && ly == 0u) {
+        s_left = 64u;
+        s_top = 64u;
+        s_right = 0u;
+        s_bottom = 0u;
+    }
+    barrier();
+    if (p.mode == 0u && lx < tw) {
+        uint top = 64u;
+        uint bottom = 0u;
+        for (uint r = ly; r < th; r += 4u) {
+            uint y = y0 + r;
+            if (cur[p.cur_offset + y * p.cur_stride + x0 + lx] != prev[p.prev_offset + y * p.prev_stride + x0 + lx]) {
+                top = min(top, r);
+                bottom = r + 1u;
+            }
+        }
+        if (bottom != 0u) {
+            atomicMin(s_left, lx);
+            atomicMax(s_right, lx + 1u);
+            atomicMin(s_top, top);
+            atomicMax(s_bottom, bottom);
+        }
+    }
+    barrier();
+    uint tile = gl_WorkGroupID.y * p.tiles_x + gl_WorkGroupID.x;
+    bool changed = p.mode == 1u || s_bottom != 0u;
+    bool copy = p.mode == 1u || (p.mode == 0u && changed && mask[tile] == 0u) || (p.mode == 2u && mask[tile] != 0u);
+    if (lx == 0u && ly == 0u && p.mode != 2u) {
+        if (p.mode == 1u) boxes[tile] = uvec4(0u, 0u, tw, th);
+        else if (changed) boxes[tile] = uvec4(s_left, s_top, s_right, s_bottom);
+        else boxes[tile] = uvec4(0u);
+    }
+    if (copy && lx < tw) {
+        for (uint r = ly; r < th; r += 4u) {
+            uint y = y0 + r;
+            staging[y * p.width + x0 + lx] = cur[p.cur_offset + y * p.cur_stride + x0 + lx];
+        }
+    }
+}

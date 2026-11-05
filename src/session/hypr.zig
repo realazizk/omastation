@@ -627,6 +627,9 @@ fn parseOptionStr(arena: std.mem.Allocator, json_in: []const u8) Error![]const u
     const json = try utf8Clean(arena, json_in);
     const O = struct { str: JsonStr = .{} };
     const o = std.json.parseFromSliceLeaky(O, arena, json, .{ .ignore_unknown_fields = true }) catch |err| return jsonError(err);
+    // Hyprland 0.56's placeholder for a string option the config leaves unset (with "set":
+    // false): its own default, which for input:kb_* is empty (xkbcommon's defaults).
+    if (std.mem.eql(u8, o.str.s, "[[EMPTY]]")) return "";
     return o.str.s;
 }
 
@@ -1029,6 +1032,17 @@ test "string option" {
     try std.testing.expectEqualStrings("", try parseOptionStr(arena.allocator(),
         \\{"option":"input:kb_variant","str":"","set":false}
     ));
+}
+
+test "an unset string option reads as empty, not Hyprland's [[EMPTY]] placeholder" {
+    // Hyprland 0.56 answers `j/getoption input:kb_variant` on a config without it with
+    // {"str": "[[EMPTY]]", "set": false}; xkbcommon fails a keymap with that variant.
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "kb_rules", "kb_model", "kb_variant", "kb_options" }) |name| {
+        const json = try std.fmt.allocPrint(arena.allocator(), "{{\"option\": \"input:{s}\", \"str\": \"[[EMPTY]]\", \"set\": false }}", .{name});
+        try std.testing.expectEqualStrings("", try parseOptionStr(arena.allocator(), json));
+    }
 }
 
 test "scale watch reports and own rules parse to an output index and a percent" {

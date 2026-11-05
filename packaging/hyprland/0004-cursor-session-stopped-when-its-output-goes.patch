@@ -1,0 +1,121 @@
+From: realazizk <azizk@tuta.com>
+Date: Wed, 28 Oct 2026 13:42:37 +0100
+Subject: [PATCH 4/4] image-copy-capture: a cursor session's capture stops when
+ its output goes
+
+A pointer cursor session never learned that its source output went (the
+"TODO: add listeners for source being destroyed"): its capture session was
+never stopped, and each later cursor frame looked the monitor up again,
+reading `m_source->m_window->m_monitor` once the output's monitor had
+expired, although an output source has no window (a null dereference), or
+sharing through the removed monitor while something still held it.
+
+The cursor session now listens for its output's disconnect and sends
+`stopped` on its capture session, as an output capture session does; a
+capture session asked for afterwards is stopped at once; and a cursor frame
+captured while the output is gone fails with `stopped`.
+---
+ src/protocols/ImageCopyCapture.cpp | 39 +++++++++++++++++++++++++++---
+ src/protocols/ImageCopyCapture.hpp |  6 +++++
+ 2 files changed, 41 insertions(+), 4 deletions(-)
+
+diff --git a/src/protocols/ImageCopyCapture.cpp b/src/protocols/ImageCopyCapture.cpp
+index 20d990b..79c1f8b 100644
+--- a/src/protocols/ImageCopyCapture.cpp
++++ b/src/protocols/ImageCopyCapture.cpp
+@@ -8,6 +8,7 @@
+ #include "../render/OpenGL.hpp"
+ #include "../desktop/state/FocusState.hpp"
+ #include "render/Renderer.hpp"
++#include "../state/MonitorState.hpp"
+ #include <algorithm>
+ 
+ using namespace Screenshare;
+@@ -104,10 +105,11 @@ CImageCopyCaptureCursorSession::CImageCopyCaptureCursorSession(SP<CExtImageCopyC
+ 
+     const auto PMONITOR = m_source->m_monitor.expired() ? m_source->m_window->m_monitor.lock() : m_source->m_monitor.lock();
+ 
+-    // TODO: add listeners for source being destroyed
+-
+     sendCursorEvents();
+     m_listeners.commit = PMONITOR->m_events.commit.listen([this, PMONITOR]() { sendCursorEvents(); });
++    // an output source going stops the capture session, as it stops an output capture session
++    if (!m_source->m_monitor.expired())
++        m_listeners.sourceGone = PMONITOR->m_events.disconnect.listen([this]() { onSourceGone(); });
+ 
+     m_resource->setDestroy([this](CExtImageCopyCaptureCursorSessionV1* pMgr) { PROTO::imageCopyCapture->destroyResource(this); });
+     m_resource->setOnDestroy([this](CExtImageCopyCaptureCursorSessionV1* pMgr) { PROTO::imageCopyCapture->destroyResource(this); });
+@@ -138,7 +140,7 @@ CImageCopyCaptureCursorSession::CImageCopyCaptureCursorSession(SP<CExtImageCopyC
+         });
+ 
+         m_session = Screenshare::mgr()->newCursorSession(pMgr->client(), m_pointer);
+-        if UNLIKELY (!m_session) {
++        if UNLIKELY (!m_session || m_sourceGone) {
+             m_sessionResource->sendStopped();
+             return;
+         }
+@@ -158,6 +160,30 @@ bool CImageCopyCaptureCursorSession::good() {
+     return m_resource && m_resource->resource();
+ }
+ 
++PHLMONITOR CImageCopyCaptureCursorSession::sourceMonitor() {
++    if (m_sourceGone || !m_source)
++        return nullptr;
++
++    const auto PMONITOR = !m_source->m_monitor.expired() ? m_source->m_monitor.lock() : (!m_source->m_window.expired() ? m_source->m_window->m_monitor.lock() : nullptr);
++    if (!PMONITOR || !State::monitorState()->contains(PMONITOR))
++        return nullptr;
++
++    return PMONITOR;
++}
++
++void CImageCopyCaptureCursorSession::onSourceGone() {
++    if (m_sourceGone)
++        return;
++
++    m_sourceGone = true;
++    m_listeners.commit.reset();
++
++    LOGM(Log::DEBUG, "Cursor copy capture session's output went: stopped");
++
++    if (m_sessionResource && m_sessionResource->resource())
++        m_sessionResource->sendStopped();
++}
++
+ void CImageCopyCaptureCursorSession::destroyCaptureSession() {
+     m_listeners.constraintsChanged.reset();
+     m_listeners.stopped.reset();
+@@ -231,7 +257,12 @@ void CImageCopyCaptureCursorSession::createFrame(SP<CExtImageCopyCaptureFrameV1>
+             return;
+         }
+ 
+-        const auto PMONITOR = m_source->m_monitor.expired() ? m_source->m_window->m_monitor.lock() : m_source->m_monitor.lock();
++        const auto PMONITOR = sourceMonitor();
++        if (!PMONITOR) {
++            // the source output went (an output source has no window to fall back on)
++            m_frameResource->sendFailed(EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_STOPPED);
++            return;
++        }
+ 
+         auto       sourceBoxCallback = [this]() { return m_source ? m_source->logicalBox() : CBox(); };
+         auto       error             = m_session->share(PMONITOR, m_buffer, sourceBoxCallback, [this](eScreenshareResult result) {
+diff --git a/src/protocols/ImageCopyCapture.hpp b/src/protocols/ImageCopyCapture.hpp
+index b8cfa1e..fb57326 100644
+--- a/src/protocols/ImageCopyCapture.hpp
++++ b/src/protocols/ImageCopyCapture.hpp
+@@ -98,9 +98,15 @@ class CImageCopyCaptureCursorSession {
+         CHyprSignalListener constraintsChanged;
+         CHyprSignalListener stopped;
+         CHyprSignalListener commit;
++        CHyprSignalListener sourceGone;
+     } m_listeners;
+ 
++    // the source output went: the capture session is stopped, its frames fail
++    bool m_sourceGone = false;
++
+     void sendCursorEvents();
++    void onSourceGone();
++    PHLMONITOR sourceMonitor();
+ 
+     void createFrame(SP<CExtImageCopyCaptureFrameV1> resource);
+     void destroyCaptureSession();

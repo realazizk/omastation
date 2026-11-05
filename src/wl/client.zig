@@ -103,6 +103,8 @@ pub const Client = struct {
     seat_caps_ever: u32 = 0,
     pointer: ?P.WlPointer = null,
 
+    /// Dmabuf wl_buffers for GPU capture (src/wl/dmabuf.zig).
+    linux_dmabuf: ?P.ZwpLinuxDmabufV1 = null,
     ext_capture: ?P.ExtImageCopyCaptureManagerV1 = null,
     ext_output_source: ?P.ExtOutputImageCaptureSourceManagerV1 = null,
     screencopy: ?P.ZwlrScreencopyManagerV1 = null,
@@ -151,6 +153,7 @@ pub const Client = struct {
             if (!o.removed and conn.version(o.proxy.id) >= 3) o.proxy.release(conn) catch {};
             client.gpa.destroy(o);
         }
+        if (client.linux_dmabuf) |m| m.destroy(conn) catch {};
         if (client.ext_capture) |m| m.destroy(conn) catch {};
         if (client.ext_output_source) |m| m.destroy(conn) catch {};
         if (client.screencopy) |m| m.destroy(conn) catch {};
@@ -168,7 +171,7 @@ pub const Client = struct {
         return client.conn.fd;
     }
 
-    /// Non-blocking: flush requests, read and dispatch available events.
+    /// Non-blocking: read and dispatch available events, then flush requests.
     pub fn dispatch(client: *Client) Error!usize {
         return client.conn.dispatch();
     }
@@ -251,6 +254,10 @@ pub const Client = struct {
                         };
                         try client.output_list.append(client.gpa, o);
                         conn.setHandler(o.proxy.id, wire.Handler.init(Output, o, Output.onEvent));
+                    },
+                    // Version 4+ sends no format list at bind; capture sessions say what they take.
+                    .zwp_linux_dmabuf_v1 => if (client.linux_dmabuf == null and g.version >= 2) {
+                        client.linux_dmabuf = try reg.bind(conn, g.name, P.ZwpLinuxDmabufV1, bindVersion(g.version, 4));
                     },
                     .ext_image_copy_capture_manager_v1 => if (client.ext_capture == null) {
                         client.ext_capture = try reg.bind(conn, g.name, P.ExtImageCopyCaptureManagerV1, 1);

@@ -65,7 +65,8 @@ fn parseHeader(dib: []const u8) c.Error!Layout {
         else => return error.InvalidDib,
     }
     switch (bpp) {
-        1, 4, 8, 16, 24, 32 => {},
+        // 48, 64: no Windows DIB depths, but FreeRDP's CF_DIB of a 16-bit PNG (decodeDib).
+        1, 4, 8, 16, 24, 32, 48, 64 => {},
         else => return error.InvalidDib,
     }
     var masks: [4]u32 = .{ 0, 0, 0, 0 };
@@ -158,7 +159,7 @@ pub fn decodeDib(gpa: Allocator, dib: []const u8) c.Error!c.Image {
         // BI_RGB 16 bpp is X1R5G5B5.
         fields = .{ .init(0x7C00), .init(0x03E0), .init(0x001F), .init(0) };
     }
-    // 32 bpp BI_RGB: the fourth byte is alpha unless it is 0 everywhere.
+    // 32 and 64 bpp BI_RGB: the fourth sample is alpha unless it is 0 everywhere.
     var any_alpha = false;
 
     for (0..h) |row| {
@@ -195,11 +196,22 @@ pub fn decodeDib(gpa: Allocator, dib: []const u8) c.Error!c.Image {
                         any_alpha = any_alpha or p[3] != 0;
                     }
                 },
+                // FreeRDP (winpr) keeps libpng's rows (BI_RGB only): B, G, R, and A at 64 bpp,
+                // 16 bits big-endian each. The high bytes, first, make 8 bits per channel.
+                48 => {
+                    const p = src[x * 6 ..][0..6];
+                    o.* = .{ p[4], p[2], p[0], 255 };
+                },
+                64 => {
+                    const p = src[x * 8 ..][0..8];
+                    o.* = .{ p[4], p[2], p[0], p[6] };
+                    any_alpha = any_alpha or p[6] != 0;
+                },
                 else => unreachable,
             }
         }
     }
-    if (l.bpp == 32 and l.compression == c.BI_RGB and !any_alpha) {
+    if ((l.bpp == 32 or l.bpp == 64) and l.compression == c.BI_RGB and !any_alpha) {
         var i: usize = 3;
         while (i < rgba.len) : (i += 4) rgba[i] = 255;
     }
@@ -267,6 +279,14 @@ pub fn encodeDibV5(gpa: Allocator, img: c.Image) c.Error![]u8 {
 
 pub fn dibToBmp(gpa: Allocator, dib: []const u8) c.Error![]u8 {
     const l = try parseHeader(dib);
+    if (l.bpp == 48 or l.bpp == 64) {
+        // BMP readers know 32 bpp; the V5 header's alpha mask keeps alpha.
+        const img = try decodeDib(gpa, dib);
+        defer img.deinit(gpa);
+        const dib32 = try encodeDibV5(gpa, img);
+        defer gpa.free(dib32);
+        return dibToBmp(gpa, dib32);
+    }
     const fh = c.bitmap_file_header_len;
     if (dib.len > std.math.maxInt(u32) - fh) return error.InvalidDib;
     const out = try gpa.alloc(u8, fh + dib.len);
@@ -285,6 +305,8 @@ pub fn bmpToDib(gpa: Allocator, bmp: []const u8) c.Error![]u8 {
     if (bmp[0] != 'B' or bmp[1] != 'M') return error.InvalidBmp;
     const dib = bmp[fh..];
     const l = parseHeader(dib) catch return error.InvalidBmp;
+    // decodeDib reads FreeRDP's 48 and 64 bpp, which need not be a file's.
+    if (l.bpp == 48 or l.bpp == 64) return error.InvalidBmp;
     const off: u64 = rd32(bmp, 10);
     if (off < fh + l.pixels_off or off > bmp.len) return error.InvalidBmp;
     const head = dib[0..@intCast(l.pixels_off)];
@@ -305,4 +327,145 @@ pub fn pngToDib(gpa: Allocator, data: []const u8) c.Error![]u8 {
     const img = try png.decodePng(gpa, data);
     defer img.deinit(gpa);
     return encodeDib(gpa, img);
+}
+
+/// xfreerdp3 3.32's CF_DIBs for 2x2 16-bit PNGs (libwinpr3's image/png -> CF_DIB): top-down
+/// BI_RGB, B G R (A) big-endian. Each sample's low byte (A1, B2, C3, D4) is not its high byte.
+const hex = @import("../../core/bytes.zig").hex;
+/// RGBA.
+const freerdp_dib64 = hex(
+    \\28 00 00 00 02 00 00 00 fe ff ff ff 01 00 40 00
+    \\00 00 00 00 20 00 00 00 02 00 00 00 02 00 00 00
+    \\00 00 00 00 00 00 00 00
+    \\90 c3 40 b2 10 a1 c0 d4  91 c3 40 b2 30 a1 d0 d4
+    \\90 c3 70 b2 18 a1 c8 d4  91 c3 70 b2 38 a1 d8 d4
+);
+/// The same colors as RGB, without alpha: 48 bpp, rows of 12 bytes.
+const freerdp_dib48 = hex(
+    \\28 00 00 00 02 00 00 00 fe ff ff ff 01 00 30 00
+    \\00 00 00 00 18 00 00 00 02 00 00 00 02 00 00 00
+    \\00 00 00 00 00 00 00 00
+    \\90 c3 40 b2 10 a1  91 c3 40 b2 30 a1
+    \\90 c3 70 b2 18 a1  91 c3 70 b2 38 a1
+);
+/// Their RGBA: the high bytes.
+const freerdp_rgba = [_]u8{
+    0x10, 0x40, 0x90, 0xc0, 0x30, 0x40, 0x91, 0xd0,
+    0x18, 0x70, 0x90, 0xc8, 0x38, 0x70, 0x91, 0xd8,
+};
+const freerdp_rgb_opaque = [_]u8{
+    0x10, 0x40, 0x90, 0xff, 0x30, 0x40, 0x91, 0xff,
+    0x18, 0x70, 0x90, 0xff, 0x38, 0x70, 0x91, 0xff,
+};
+
+/// A 48 or 64 bpp DIB with a `header_len` header; `samples` are 16-bit, in storage order (row padding included).
+fn testDib16(gpa: Allocator, header_len: u32, bpp: u16, width: i32, height: i32, compression: u32, samples: []const u16) ![]u8 {
+    const d = try gpa.alloc(u8, header_len + 2 * samples.len);
+    @memset(d[0..header_len], 0);
+    wr32(d, 0, header_len);
+    wr32(d, 4, @bitCast(width));
+    wr32(d, 8, @bitCast(height));
+    wr16(d, 12, 1);
+    wr16(d, 14, bpp);
+    wr32(d, 16, compression);
+    wr32(d, 20, @intCast(2 * samples.len));
+    for (samples, 0..) |v, i| std.mem.writeInt(u16, d[header_len + 2 * i ..][0..2], v, .big);
+    return d;
+}
+
+/// `dib` through decodeDib, and the image/png and image/bmp a paste of it gets, is `rgba`.
+fn expectDibPastes(dib: []const u8, format_id: u32, rgba: []const u8) !void {
+    const gpa = std.testing.allocator;
+    const img = try decodeDib(gpa, dib);
+    defer img.deinit(gpa);
+    try std.testing.expectEqualSlices(u8, rgba, img.rgba);
+    const p = try c.convertFromRemote(gpa, .{ .id = format_id }, c.mime_png, dib);
+    defer gpa.free(p);
+    const from_png = try png.decodePng(gpa, p);
+    defer from_png.deinit(gpa);
+    try std.testing.expectEqualSlices(u8, rgba, from_png.rgba);
+    const bmp = try c.convertFromRemote(gpa, .{ .id = format_id }, c.mime_bmp, dib);
+    defer gpa.free(bmp);
+    try std.testing.expectEqual(@as(u16, 32), rd16(bmp, c.bitmap_file_header_len + 14));
+    const back = try bmpToDib(gpa, bmp);
+    defer gpa.free(back);
+    const from_bmp = try decodeDib(gpa, back);
+    defer from_bmp.deinit(gpa);
+    try std.testing.expectEqualSlices(u8, rgba, from_bmp.rgba);
+}
+
+test "FreeRDP's 64 bpp CF_DIB of a 16-bit PNG keeps each sample's high byte" {
+    try expectDibPastes(&freerdp_dib64, c.CF_DIB, &freerdp_rgba);
+    const img = try decodeDib(std.testing.allocator, &freerdp_dib64);
+    defer img.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), img.width);
+    try std.testing.expectEqual(@as(u32, 2), img.height);
+}
+
+test "FreeRDP's 48 bpp CF_DIB of a 16-bit PNG without alpha: high bytes, opaque" {
+    try expectDibPastes(&freerdp_dib48, c.CF_DIB, &freerdp_rgb_opaque);
+}
+
+test "48 bpp rows are padded to 4 bytes" {
+    // libwinpr fails odd widths; others pad as for any DIB: 6 bytes of pixel, 2 of padding.
+    const gpa = std.testing.allocator;
+    const padded = try testDib16(gpa, c.bitmap_info_header_len, 48, 1, 2, c.BI_RGB, &.{ 0x1100, 0x2200, 0x3300, 0xdead, 0x4400, 0x5500, 0x6600, 0xbeef });
+    defer gpa.free(padded);
+    try expectDibPastes(padded, c.CF_DIB, &.{ 0x66, 0x55, 0x44, 0xff, 0x33, 0x22, 0x11, 0xff });
+    try std.testing.expectError(error.InvalidDib, decodeDib(gpa, padded[0 .. padded.len - 2]));
+}
+
+test "64 bpp CF_DIBV5: bottom-up rows, alpha unless 0 everywhere" {
+    const gpa = std.testing.allocator;
+    // Bottom row first: blue at half alpha, then red, opaque.
+    const v5 = try testDib16(gpa, c.bitmap_v5_header_len, 64, 1, 2, c.BI_RGB, &.{ 0xff00, 0x0000, 0x0000, 0x8000, 0x0000, 0x0000, 0xffff, 0xffff });
+    defer gpa.free(v5);
+    try expectDibPastes(v5, c.CF_DIBV5, &.{ 0xff, 0, 0, 0xff, 0, 0, 0xff, 0x80 });
+    // No alpha anywhere: opaque, as for 32 bpp BI_RGB.
+    const opaque_v5 = try testDib16(gpa, c.bitmap_v5_header_len, 64, 2, -1, c.BI_RGB, &.{ 0x1234, 0x5678, 0x9abc, 0x00ff, 0xffff, 0xffff, 0xffff, 0x0000 });
+    defer gpa.free(opaque_v5);
+    try expectDibPastes(opaque_v5, c.CF_DIBV5, &.{ 0x9a, 0x56, 0x12, 0xff, 0xff, 0xff, 0xff, 0xff });
+}
+
+test "48 and 64 bpp DIBs keep the size cap and refuse malformed input" {
+    const gpa = std.testing.allocator;
+    const px = [_]u16{ 1, 2, 3, 4 };
+    for ([_]u16{ 48, 64 }) |bpp| {
+        // Masks cannot describe pixels over 32 bits.
+        const bitfields = try testDib16(gpa, c.bitmap_v5_header_len, bpp, 1, 1, c.BI_BITFIELDS, &px);
+        defer gpa.free(bitfields);
+        try std.testing.expectError(error.InvalidDib, decodeDib(gpa, bitfields));
+        // One byte of pixels missing (a 48 bpp row of one pixel is 8 bytes, as 64 bpp).
+        const short = try testDib16(gpa, c.bitmap_info_header_len, bpp, 1, 1, c.BI_RGB, &px);
+        defer gpa.free(short);
+        try std.testing.expectError(error.InvalidDib, decodeDib(gpa, short[0 .. short.len - 1]));
+        // Two rows of one pixel are 16 bytes, not 8.
+        const rows = try testDib16(gpa, c.bitmap_info_header_len, bpp, 1, 2, c.BI_RGB, &px);
+        defer gpa.free(rows);
+        try std.testing.expectError(error.InvalidDib, decodeDib(gpa, rows));
+        // Over max_image_pixels is refused before the pixels are looked at.
+        const huge = try testDib16(gpa, c.bitmap_info_header_len, bpp, 1 << 13, (1 << 13) + 1, c.BI_RGB, &px);
+        defer gpa.free(huge);
+        try std.testing.expectError(error.ImageTooLarge, decodeDib(gpa, huge));
+        try std.testing.expectError(error.ImageTooLarge, c.dibToPng(gpa, huge));
+    }
+    // A 48 or 64 bpp BMP file from the desktop is not taken for FreeRDP's layout.
+    for ([_][]const u8{ &freerdp_dib48, &freerdp_dib64 }) |dib| {
+        const bmp = try dibToBmpRaw(gpa, dib);
+        defer gpa.free(bmp);
+        try std.testing.expectError(error.InvalidBmp, bmpToDib(gpa, bmp));
+    }
+}
+
+/// `dib` behind a BITMAPFILEHEADER as is.
+fn dibToBmpRaw(gpa: Allocator, dib: []const u8) ![]u8 {
+    const fh = c.bitmap_file_header_len;
+    const out = try gpa.alloc(u8, fh + dib.len);
+    @memset(out[0..fh], 0);
+    out[0] = 'B';
+    out[1] = 'M';
+    wr32(out, 2, @intCast(out.len));
+    wr32(out, 10, fh + rd32(dib, 0));
+    @memcpy(out[fh..], dib);
+    return out;
 }

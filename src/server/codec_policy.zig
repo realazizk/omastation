@@ -37,6 +37,7 @@ const nsc = @import("../codec/nsc.zig");
 const bulk_codec = @import("../codec/bulk.zig");
 const progressive = @import("../codec/progressive.zig");
 const avc444 = @import("../codec/avc444.zig");
+const h264 = @import("../codec/h264.zig");
 
 pub const LossyMotion = enum {
     /// When the link is slow or distant (adapt.zig).
@@ -61,6 +62,8 @@ pub const Options = struct {
     bulk: ?bulk_codec.Type = .xcrush,
     /// DRM render node for H.264 (`--gpu`); null: the first whose driver encodes H.264.
     vaapi_device: ?[:0]const u8 = null,
+    /// Who encodes H.264 (`--h264-encoder`): VA-API, else OpenH264 in software, by default.
+    h264_encoder: h264.Backend = .auto,
 
     /// Deterministic pipelines for tests that model planar frames.
     pub const planar_avc420: Options = .{ .avc444 = false, .progressive = false, .remotefx = false, .nscodec = false, .clearcodec = false };
@@ -78,7 +81,7 @@ pub const Options = struct {
         while (it.next()) |name| {
             if (std.mem.eql(u8, name, "all")) {
                 const keep = o.*;
-                o.* = .{ .lossy_motion = keep.lossy_motion, .bulk = keep.bulk, .rdpgfx = keep.rdpgfx, .vaapi_device = keep.vaapi_device };
+                o.* = .{ .lossy_motion = keep.lossy_motion, .bulk = keep.bulk, .rdpgfx = keep.rdpgfx, .vaapi_device = keep.vaapi_device, .h264_encoder = keep.h264_encoder };
             } else if (std.mem.eql(u8, name, "none") or std.mem.eql(u8, name, "planar")) {} else if (std.mem.eql(u8, name, "avc444")) {
                 o.avc444 = true;
                 o.avc444_preferred = true;

@@ -46,6 +46,8 @@ pub const DesktopOps = struct {
     /// Waits up to 1 s for `wake_fd`, desk input, `until_ms` or the session's end.
     wait: *const fn (d: *Desktop, wake_fd: c_int, until_ms: i64) Wake = Desktop.waitLingering,
     destroy: *const fn (d: *Desktop) void = Desktop.destroy,
+    /// Readies a desktop for another connection (its captures stopped), before it is parked.
+    park: *const fn (d: *Desktop) void = Desktop.parkForHandover,
 };
 
 /// Desk speakers a connection left muted for the session.
@@ -247,6 +249,7 @@ pub const Seat = struct {
         const w = s.waiter orelse return false;
         // Only a desktop in remote mode is handed on; otherwise the waiter starts afresh.
         if (!d.handable()) return false;
+        s.ops.park(d);
         s.parked = d;
         s.parked_resumed = false;
         s.owner = null;
@@ -280,6 +283,7 @@ pub const Seat = struct {
         s.lock();
         std.debug.assert(s.owner == cl);
         if (s.waiter) |w| if (d.handable()) {
+            s.ops.park(d);
             s.parked = d;
             s.parked_resumed = false;
             s.owner = null;
@@ -412,7 +416,13 @@ const Linger = struct {
 };
 
 test "takeover hands the desktop to the newest connection" {
-    var seat = Seat{};
+    const Parked = struct {
+        var count: u32 = 0;
+        fn park(_: *Desktop) void {
+            count += 1;
+        }
+    };
+    var seat = Seat{ .ops = .{ .park = Parked.park } };
     var a = try Claim.init();
     defer a.deinit();
     var b = try Claim.init();
@@ -438,6 +448,7 @@ test "takeover hands the desktop to the newest connection" {
     th.join();
     try std.testing.expectEqual(@as(?*Desktop, &fake), got);
     try std.testing.expectEqual(@as(?*const Claim, &b), seat.owner);
+    try std.testing.expectEqual(1, Parked.count); // its captures stopped first
 
     try std.testing.expect(!seat.handOver(&b, &fake));
     seat.done(&b);

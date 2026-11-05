@@ -1,0 +1,89 @@
+#version 450
+// tilediff.comp four pixels at a time (16-byte loads and stores, wider writes across PCIe into
+// host memory): for frames whose rows, offsets and destination rows are 16-byte aligned (width a
+// multiple of 4). Same results as tilediff.comp: exact boxes of the changed pixels, changed tiles
+// copied. Rebuild: ./build.sh (glslc); the SPIR-V is committed.
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Cur { uvec4 cur[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Prev { uvec4 prev[]; };
+layout(std430, set = 0, binding = 2) writeonly buffer Boxes { uvec4 boxes[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer Staging { uvec4 staging[]; };
+layout(std430, set = 0, binding = 4) readonly buffer Mask { uint mask[]; };
+
+// Offsets and strides in 16-byte units; width and height in pixels.
+layout(push_constant) uniform Params {
+    uint width;
+    uint height;
+    uint cur_offset;
+    uint cur_stride;
+    uint prev_offset;
+    uint prev_stride;
+    uint tiles_x;
+    uint mode;
+} p;
+
+shared uint s_left;
+shared uint s_top;
+shared uint s_right;
+shared uint s_bottom;
+
+void main() {
+    uint x0 = gl_WorkGroupID.x * 64u;
+    uint y0 = gl_WorkGroupID.y * 64u;
+    uint tw4 = min(64u, p.width - x0) / 4u;
+    uint th = min(64u, p.height - y0);
+    uint lx = gl_LocalInvocationID.x;
+    uint ly = gl_LocalInvocationID.y;
+    uint q0 = x0 / 4u;
+    uint dst_stride = p.width / 4u;
+    if (lx == 0u && ly == 0u) {
+        s_left = 64u;
+        s_top = 64u;
+        s_right = 0u;
+        s_bottom = 0u;
+    }
+    barrier();
+    if (p.mode == 0u && lx < tw4) {
+        uint top = 64u;
+        uint bottom = 0u;
+        uint left = 64u;
+        uint right = 0u;
+        for (uint r = ly; r < th; r += 16u) {
+            uint y = y0 + r;
+            bvec4 ne = notEqual(cur[p.cur_offset + y * p.cur_stride + q0 + lx], prev[p.prev_offset + y * p.prev_stride + q0 + lx]);
+            if (any(ne)) {
+                top = min(top, r);
+                bottom = r + 1u;
+                for (uint k = 0u; k < 4u; k++) {
+                    if (ne[k]) {
+                        left = min(left, lx * 4u + k);
+                        right = max(right, lx * 4u + k + 1u);
+                    }
+                }
+            }
+        }
+        if (bottom != 0u) {
+            atomicMin(s_left, left);
+            atomicMax(s_right, right);
+            atomicMin(s_top, top);
+            atomicMax(s_bottom, bottom);
+        }
+    }
+    barrier();
+    uint tile = gl_WorkGroupID.y * p.tiles_x + gl_WorkGroupID.x;
+    bool changed = p.mode == 1u || s_bottom != 0u;
+    bool copy = p.mode == 1u || (p.mode == 0u && changed && mask[tile] == 0u) || (p.mode == 2u && mask[tile] != 0u);
+    if (lx == 0u && ly == 0u && p.mode != 2u) {
+        if (p.mode == 1u) boxes[tile] = uvec4(0u, 0u, tw4 * 4u, th);
+        else if (changed) boxes[tile] = uvec4(s_left, s_top, s_right, s_bottom);
+        else boxes[tile] = uvec4(0u);
+    }
+    if (copy && lx < tw4) {
+        for (uint r = ly; r < th; r += 16u) {
+            uint y = y0 + r;
+            staging[y * dst_stride + q0 + lx] = cur[p.cur_offset + y * p.cur_stride + q0 + lx];
+        }
+    }
+}

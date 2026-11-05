@@ -4,12 +4,17 @@
 // 2. absolute pointer motion moves the hardware cursor;
 // 3. RDP outputs' own frames leave out the software cursor (the client draws it);
 // 4. `hyprctl omastation-cursor` reports the cursor image's scale, hotspot and visibility;
-// 5. capturing a window whose monitor is gone fails instead of crashing Hyprland.
+// 5. capturing a window whose monitor is gone fails instead of crashing Hyprland;
+// 6. so does a capture request (output frame, cursor frame) reaching it after its output went.
 // It only loads into the Hyprland build it was compiled for; a hook that cannot
 // be installed is skipped.
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
 #include <hyprland/src/managers/screenshare/ScreenshareManager.hpp>
+#include <hyprland/src/protocols/ImageCaptureSource.hpp>
+#include <hyprland/src/protocols/ImageCopyCapture.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/protocols/ext-image-copy-capture-v1.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprland/src/protocols/core/Seat.hpp>
@@ -70,12 +75,36 @@ struct SOnCursorMoved {
 struct SManagedSessions {
     friend constexpr auto privateMember(SManagedSessions);
 };
+struct SSessionType {
+    friend constexpr auto privateMember(SSessionType);
+};
+struct SCursorPending {
+    friend constexpr auto privateMember(SCursorPending);
+};
+struct SCursorSource {
+    friend constexpr auto privateMember(SCursorSource);
+};
+struct SSourceMonitor {
+    friend constexpr auto privateMember(SSourceMonitor);
+};
+struct SSourceWindow {
+    friend constexpr auto privateMember(SSourceWindow);
+};
+struct SFrameRequests {
+    friend constexpr auto privateMember(SFrameRequests);
+};
 
 template struct SPrivate<SFrameSession, &Screenshare::CScreenshareFrame::m_session>;
 template struct SPrivate<SSessionClient, &Screenshare::CScreenshareSession::m_client>;
 template struct SPrivate<SMonitorStates, &Pointer::CPointerManager::m_monitorStates>;
 template struct SPrivate<SOnCursorMoved, &Pointer::CPointerManager::onCursorMoved>;
 template struct SPrivate<SManagedSessions, &Screenshare::CScreenshareManager::m_managedSessions>;
+template struct SPrivate<SSessionType, &Screenshare::CScreenshareSession::m_type>;
+template struct SPrivate<SCursorPending, &Screenshare::CCursorshareSession::m_pendingFrame>;
+template struct SPrivate<SCursorSource, &CImageCopyCaptureCursorSession::m_source>;
+template struct SPrivate<SSourceMonitor, &CImageCaptureSource::m_monitor>;
+template struct SPrivate<SSourceWindow, &CImageCaptureSource::m_window>;
+template struct SPrivate<SFrameRequests, &CExtImageCopyCaptureFrameV1::requests>;
 
 // ---- protected windows ----
 
@@ -107,7 +136,7 @@ namespace Protected {
 
     static bool exempt(Screenshare::CScreenshareFrame* frame) noexcept {
         try {
-            // Owned by a unique pointer: used directly.
+            // A weak pointer: null once the session is gone.
             const auto* session = (frame->*privateMember(SFrameSession{})).get();
             if (!session)
                 return false;
@@ -293,6 +322,101 @@ namespace GoneMonitor {
     }
 }
 
+// ---- capture requests for an output that is gone ----
+// A capture request can reach Hyprland after its output went: an RDP output removed
+// while a client's next frame was on its way, a monitor unplugged. Hyprland 0.56 then
+// reads the gone monitor and crashes. Instead:
+// a. a new frame of a stopped output session gets the normal transform (the
+//    frame's constructor reads it); capturing it then fails with `stopped`;
+// b. a cursor session's pending frame, copied at the next cursor change through
+//    its monitor, fails;
+// c. a cursor frame captured on a gone output (whose capture reads a window the
+//    output source does not have) fails with `stopped`.
+
+namespace GoneOutput {
+
+    static CFunctionHook* g_transform   = nullptr;
+    static CFunctionHook* g_cursorCopy  = nullptr;
+    static CFunctionHook* g_cursorFrame = nullptr;
+
+    // Removed, though something may still hold it.
+    static bool gone(const PHLMONITOR& monitor) {
+        return !monitor || !State::monitorState()->contains(monitor);
+    }
+
+    static void report(std::string_view what) {
+        Log::logger->log(Log::ERR, "[omastation] {} of an output that is gone: failed instead of crashing Hyprland", what);
+    }
+
+    using FTransform = wl_output_transform (*)(const void*);
+
+    static wl_output_transform hkTransform(const void* thisptr) {
+        try {
+            const auto* frame   = sc<const Screenshare::CScreenshareFrame*>(thisptr);
+            const auto* session = (frame->*privateMember(SFrameSession{})).get();
+            if (!session)
+                return WL_OUTPUT_TRANSFORM_NORMAL;
+            const auto TYPE = session->*privateMember(SSessionType{});
+            if ((TYPE == Screenshare::SHARE_MONITOR || TYPE == Screenshare::SHARE_REGION) && !session->monitor()) {
+                report("a new frame");
+                return WL_OUTPUT_TRANSFORM_NORMAL;
+            }
+        } catch (...) {}
+        return rc<FTransform>(g_transform->m_original)(thisptr);
+    }
+
+    using FCursorCopy = bool (*)(void*);
+
+    static bool hkCursorCopy(void* thisptr) {
+        try {
+            const auto& PENDING = sc<Screenshare::CCursorshareSession*>(thisptr)->*privateMember(SCursorPending{});
+            if (PENDING.monitor && gone(PENDING.monitor)) {
+                report("a cursor image");
+                return false;
+            }
+        } catch (...) {}
+        return rc<FCursorCopy>(g_cursorCopy->m_original)(thisptr);
+    }
+
+    // The cursor session's source: an output that is gone, or a window without one.
+    static bool sourceGone(CImageCopyCaptureCursorSession* session) {
+        const auto& SOURCE = session->*privateMember(SCursorSource{});
+        if (!SOURCE)
+            return true;
+        const auto& MONITOR = SOURCE.get()->*privateMember(SSourceMonitor{});
+        if (!MONITOR.expired())
+            return gone(MONITOR.lock());
+        const auto& WINDOW = SOURCE.get()->*privateMember(SSourceWindow{});
+        return WINDOW.expired() || gone(WINDOW->m_monitor.lock());
+    }
+
+    using FCursorFrame = void (*)(void*, SP<CExtImageCopyCaptureFrameV1>);
+
+    // The original sets the frame's handlers; its capture handler runs only while the source is there.
+    static void hkCursorCreateFrame(void* thisptr, SP<CExtImageCopyCaptureFrameV1> resource) {
+        rc<FCursorFrame>(g_cursorFrame->m_original)(thisptr, resource);
+        try {
+            if (!resource)
+                return;
+            auto& requests = resource.get()->*privateMember(SFrameRequests{});
+            auto  capture  = std::move(requests.capture);
+            if (!capture)
+                return;
+            auto* const SESSION = sc<CImageCopyCaptureCursorSession*>(thisptr);
+            resource->setCapture([SESSION, capture = std::move(capture)](CExtImageCopyCaptureFrameV1* frame) {
+                bool isGone = false;
+                try {
+                    isGone = sourceGone(SESSION);
+                } catch (...) {}
+                if (!isGone)
+                    return capture(frame);
+                report("a cursor frame");
+                frame->sendFailed(EXT_IMAGE_COPY_CAPTURE_FRAME_V1_FAILURE_REASON_STOPPED);
+            });
+        } catch (...) {}
+    }
+}
+
 // In the plugin description; omastation checks for it in `hyprctl plugin list`.
 static constexpr const char* RDP_CURSOR_MARKER = "[rdp-frames-without-cursor]";
 
@@ -462,7 +586,15 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         GoneMonitor::g_getSession = hookOrSkip("Screenshare::CScreenshareManager::getManagedSession(wl_client*, Hyprutils::Memory::CSharedPointer<Desktop::View::CWindow>)",
                                                rc<const void*>(&GoneMonitor::hkGetSession), "capturing again a window whose monitor came back");
 
-    if (!Protected::g_render && !Protected::g_storeTempFB && !Cursor::g_warpAbsolute && !SoftwareCursor::g_render && !GoneMonitor::g_init)
+    GoneOutput::g_transform   = hookOrSkip("Screenshare::CScreenshareFrame::transform() const", rc<const void*>(&GoneOutput::hkTransform),
+                                           "the fix for a new frame of an output that is gone");
+    GoneOutput::g_cursorCopy  = hookOrSkip("Screenshare::CCursorshareSession::copy()", rc<const void*>(&GoneOutput::hkCursorCopy),
+                                           "the fix for a cursor image of an output that is gone");
+    GoneOutput::g_cursorFrame = hookOrSkip("CImageCopyCaptureCursorSession::createFrame(Hyprutils::Memory::CSharedPointer<CExtImageCopyCaptureFrameV1>)",
+                                           rc<const void*>(&GoneOutput::hkCursorCreateFrame), "the fix for a cursor frame of an output that is gone");
+
+    if (!Protected::g_render && !Protected::g_storeTempFB && !Cursor::g_warpAbsolute && !SoftwareCursor::g_render && !GoneMonitor::g_init && !GoneOutput::g_transform &&
+        !GoneOutput::g_cursorCopy && !GoneOutput::g_cursorFrame)
         throw std::runtime_error("omastation plugin: none of its hooks could be installed");
 
     try {
@@ -473,9 +605,10 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     Log::logger->log(Log::INFO,
                      "[omastation] loaded for Hyprland build {}: protected windows {}, absolute motion cursor fix {}, RDP frames without the cursor {}, "
-                     "capturing windows of a gone monitor fix {}",
+                     "capturing windows of a gone monitor fix {}, capture requests for a gone output fix {}/{}/{} (frame/cursor image/cursor frame)",
                      RUNNING, Protected::g_render ? "on" : "off", Cursor::g_warpAbsolute ? "on" : "off", SoftwareCursor::g_render ? "on" : "off",
-                     GoneMonitor::g_init ? "on" : "off");
+                     GoneMonitor::g_init ? "on" : "off", GoneOutput::g_transform ? "on" : "off", GoneOutput::g_cursorCopy ? "on" : "off",
+                     GoneOutput::g_cursorFrame ? "on" : "off");
     std::string description = "protected windows for omastation's capture of its outputs; absolute motion moves the hardware cursor";
     if (SoftwareCursor::g_render)
         description += std::string{"; RDP outputs' frames without the cursor "} + RDP_CURSOR_MARKER;
@@ -483,5 +616,6 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 }
 
 APICALL EXPORT void PLUGIN_EXIT() {
-    // Hyprland removes the hooks itself.
+    // Hyprland removes the hooks itself. The capture handlers hkCursorCreateFrame set on frames
+    // still pending stay: an unload with such a frame outstanding is unsafe.
 }

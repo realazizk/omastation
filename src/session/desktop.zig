@@ -21,6 +21,7 @@ const layouts = @import("../input/layouts.zig");
 const translate = @import("../input/translate.zig");
 const fastpath = @import("../proto/fastpath.zig");
 const cursor_mod = @import("cursor.zig");
+const gpucap = @import("../gpu/capture.zig");
 
 const log = std.log.scoped(.desktop);
 
@@ -54,6 +55,9 @@ pub const Options = struct {
     require_fence: bool = false,
     cursor: cursor_mod.Mode = .auto,
     capture_backend: wl.capture.Backend = .ext,
+    /// Capture into dmabufs and find changes on the GPU (src/gpu/capture.zig), each output
+    /// falling back to shm on its own.
+    gpu_capture: bool = false,
     /// Option + drag bindings added, for omastation-recover after a crash; null: none.
     binds_state_path: ?[:0]const u8 = null,
     /// Console restore plan while remote, for omastation-recover after a crash; null: none.
@@ -122,11 +126,18 @@ pub const Desktop = struct {
     workspaces: []const hypr.WorkspaceState = &.{},
     /// Remote mode: the physical monitors are off.
     entered: bool = false,
+    /// enter() completed: from then on the remote side may see the desktop and type into it.
+    /// Before, a failure restores the console without a lock (nothing was shown remotely).
+    live: bool = false,
 
     client: ?*wl.Client = null,
     output: ?*wl.Output = null,
     capture: ?*wl.Capture = null,
     more: [multimon.max_monitors - 1]More = @splat(.{}),
+    /// GPU capture (`Options.gpu_capture`): the buffers' allocator and Vulkan device, and per
+    /// output its change detection.
+    gpu_shared: ?*gpucap.Shared = null,
+    gpu_out: [multimon.max_monitors]gpucap.Output = undefined,
     vk: ?wl.VirtualKeyboard = null,
     keymap: ?keyboard.Keymap = null,
     kstate: ?keyboard.State = null,
@@ -239,12 +250,27 @@ pub const Desktop = struct {
             .text = text,
             .cursor = cursor_mod.Tracker.init(gpa, opts.cursor),
         };
+        if (opts.gpu_capture) {
+            const sh = gpucap.Shared.create(gpa) catch |e| {
+                d.text.deinit(gpa);
+                d.cursor.deinit();
+                d.arena.deinit();
+                return e;
+            };
+            d.gpu_shared = sh;
+            for (&d.gpu_out) |*o| o.* = gpucap.Output.init(sh);
+        }
         return d;
     }
 
     pub fn destroy(d: *Desktop) void {
         d.endUnlock();
         d.leave();
+        // After the captures (their buffers come from the shared allocator).
+        if (d.gpu_shared) |sh| {
+            for (&d.gpu_out) |*o| o.deinit();
+            sh.destroy();
+        }
         d.cursor.deinit();
         d.text.deinit(d.gpa);
         d.arena.deinit();
@@ -369,6 +395,7 @@ pub const Desktop = struct {
         });
 
         try d.connectWayland();
+        d.live = true;
     }
 
     fn connectWayland(d: *Desktop) Error!void {
@@ -423,7 +450,10 @@ pub const Desktop = struct {
         const slot = d.captureSlot(i);
         if (slot.*) |cap| cap.deinit();
         slot.* = null;
-        slot.* = try wl.Capture.init(client, out, .{ .backend = d.opts.capture_backend, .paint_cursors = d.cursor.painting });
+        const base: wl.capture.Options = .{ .backend = d.opts.capture_backend, .paint_cursors = d.cursor.painting };
+        const gpu_on = if (d.gpu_shared != null) !d.gpu_out[i].off else false;
+        if (gpu_on) d.gpu_out[i].setName(d.plan.outputs[i].name());
+        slot.* = try wl.Capture.init(client, out, if (gpu_on) d.gpu_shared.?.captureOptions(base) else base);
         if (slot.*.?.kind == .wlr) log.info("{s}: capturing with wlr-screencopy", .{d.plan.outputs[i].name()});
         try slot.*.?.requestFrame();
     }
@@ -554,7 +584,8 @@ pub const Desktop = struct {
         d.events_fd = -1;
         if (d.entered) d.removeScaleWatch();
         d.user_scale = @splat(null);
-        if (d.entered and d.desk_owns) {
+        if (d.entered and (d.desk_owns or !d.live)) {
+            if (!d.live) log.warn("remote mode abandoned before the client saw anything: physical monitors back on, no lock needed", .{});
             d.restoreConsole();
             d.entered = false;
         } else if (d.entered) {
@@ -1091,12 +1122,47 @@ pub const Desktop = struct {
         d.releaseKeys();
         d.releaseButtons() catch {};
         d.releaseTouch();
+        d.stopCaptures();
+    }
+
+    /// Before the desktop changes hands (seat.Seat.handOver). The new connection starts its own
+    /// captures, and may remove outputs (fewer monitors) the old ones still had frames queued for.
+    pub fn parkForHandover(d: *Desktop) void {
+        d.stopCaptures();
+    }
+
+    fn stopCaptures(d: *Desktop) void {
         for (0..d.plan.count) |i| {
             const slot = d.captureSlot(i);
             if (slot.*) |cap| cap.deinit();
             slot.* = null;
         }
-        if (d.client) |cl| cl.flush() catch {};
+        d.settleRequests();
+    }
+
+    /// Stops the captures, cursor sessions and virtual pointers of the outputs from `first` on,
+    /// and has the compositor take that before anything else: a capture request reaching
+    /// Hyprland 0.56 after its output went crashes it, so this comes before `output remove`.
+    fn dropOutputsFrom(d: *Desktop, first: usize) void {
+        if (first >= d.plan.count) return;
+        for (first..d.plan.count) |i| {
+            const slot = d.captureSlot(i);
+            if (slot.*) |cap| cap.deinit();
+            slot.* = null;
+            const vp = d.vpSlot(i);
+            if (vp.*) |*p| p.deinit();
+            vp.* = null;
+            d.stopCursorAt(i);
+            d.setOutput(i, null);
+        }
+        d.settleRequests();
+    }
+
+    /// The compositor has processed every request sent so far, before an IPC command that
+    /// follows (its socket is another one, served in no particular order).
+    fn settleRequests(d: *Desktop) void {
+        const client = d.client orelse return;
+        client.roundtrip(wl.Client.teardown_timeout_ms) catch |err| log.warn("the compositor did not confirm the stopped captures ({t})", .{err});
     }
 
     /// Waits at most a second, still serving Hyprland's events and the Wayland connection.
@@ -1565,6 +1631,13 @@ pub const Desktop = struct {
         pub fn info(s: FrameSource) OutputInfo {
             return s.d.outputInfo(s.index);
         }
+
+        /// How this output's dmabuf frames reach the encoder (GPU capture), if on.
+        pub fn gpu(s: FrameSource) ?gpucap.Handle {
+            if (s.d.gpu_shared == null) return null;
+            const cap = s.d.captureAt(s.index) orelse return null;
+            return .{ .out = &s.d.gpu_out[s.index], .cap = cap };
+        }
     };
 
     const ConstSource = struct {
@@ -1863,7 +1936,8 @@ pub const Desktop = struct {
         if (d.touch_mode != .off) d.reopenTouch();
     }
 
-    /// DISPLAYCONTROL_MONITOR_LAYOUT_PDU; outputs keep names by position and stay as they were on failure.
+    /// DISPLAYCONTROL_MONITOR_LAYOUT_PDU; outputs keep names by position. On failure the outputs
+    /// that were to go are gone (they stop being captured before any step runs), the rest stay.
     pub fn relayout(d: *Desktop, l: *const multimon.Layout) Error!void {
         if (l.count == 0 or l.count > multimon.max_monitors) return error.BadLayout;
         d.client_layout = l.*;
@@ -1882,27 +1956,25 @@ pub const Desktop = struct {
         const a = arena.allocator();
         const base_x = if (d.entered) console.rdpBaseX(d.monitors) else d.plan.outputs[0].x;
         const plan = multimon.planSession(l, .{ .base_x = base_x }) catch return error.BadLayout;
-        if (d.entered) {
+        const steps: []const console.Step = if (d.entered) blk: {
             const current = try hypr.monitors(&d.ipc, a);
             const wss: []const hypr.WorkspaceState = hypr.workspaces(&d.ipc, a) catch &.{};
-            const steps = console.planRelayout(a, &plan, current, wss) catch |err| return planError(err);
-            for (steps) |st| {
-                if (st.critical) {
-                    try d.hyprCommand(st.cmd);
-                } else d.hyprCommand(st.cmd) catch |err| log.warn("`{s}` failed: {t}", .{ st.cmd, err });
-            }
-        }
+            break :blk console.planRelayout(a, &plan, current, wss) catch |err| return planError(err);
+        } else &.{};
         const old_count = d.plan.count;
-        if (old_count > plan.count) for (plan.count..old_count) |i| {
-            const slot = d.captureSlot(i);
-            if (slot.*) |cap| cap.deinit();
-            slot.* = null;
-            const vp = d.vpSlot(i);
-            if (vp.*) |*p| p.deinit();
-            vp.* = null;
-            d.stopCursorAt(i);
-            d.setOutput(i, null);
-        };
+        d.dropOutputsFrom(plan.count);
+        for (steps) |st| {
+            if (st.critical) {
+                d.hyprCommand(st.cmd) catch |err| {
+                    if (plan.count < old_count) {
+                        d.plan.count = plan.count;
+                        d.fit = outputFit(&d.plan, 0);
+                        if (d.pointer_on >= d.plan.count) d.pointer_on = 0;
+                    }
+                    return err;
+                };
+            } else d.hyprCommand(st.cmd) catch |err| log.warn("`{s}` failed: {t}", .{ st.cmd, err });
+        }
         d.plan = plan;
         d.fit = outputFit(&plan, 0);
         d.layout = if (l.count > 1) l.* else null;
@@ -2624,4 +2696,125 @@ fn sleepMs(ms: u32) void {
 
 test "desktop compiles" {
     std.testing.refAllDecls(Desktop);
+}
+
+const FakeCompositor = @import("../wl/fake_test.zig");
+const FakeHypr = @import("fake_hypr.zig").FakeHypr;
+
+/// A remote desktop of `n` 320x200 outputs on a fake compositor and a fake Hyprland, each
+/// output captured (a frame taken and the next one requested, still queued, as pumpDesktop
+/// leaves them) and its cursor captured.
+const TestDesk = struct {
+    journal: FakeCompositor.Journal = .{},
+    h: FakeCompositor.Harness = undefined,
+    hy: *FakeHypr = undefined,
+    d: *Desktop = undefined,
+
+    const names = [_][]const u8{ "RDP-1", "RDP-2", "RDP-3" };
+
+    fn layoutOf(n: usize) multimon.Layout {
+        var l: multimon.Layout = .{ .count = n };
+        for (0..n) |k| l.monitors[k] = .{ .left = @intCast(320 * k), .top = 0, .width = 320, .height = 200, .primary = k == 0 };
+        return l;
+    }
+
+    fn start(t: *TestDesk, n: usize) !void {
+        const gpa = std.testing.allocator;
+        t.h = try FakeCompositor.Harness.startWith(.{ .output_names = names[0..n], .width = 320, .height = 200, .journal = &t.journal });
+        errdefer t.h.stop() catch {};
+        t.hy = try FakeHypr.start(gpa, &t.journal, t.h.fake, n);
+        errdefer t.hy.destroy();
+        const d = try Desktop.create(gpa, t.hy.ipc, .{ .width = @intCast(320 * n), .height = 200, .layout = if (n > 1) layoutOf(n) else null });
+        t.d = d;
+        d.entered = true;
+        d.client = t.h.client;
+        for (0..n) |i| d.setOutput(i, t.h.client.findOutput(d.plan.outputs[i].name()).?);
+        for (0..n) |i| {
+            try d.startCaptureAt(i);
+            d.startCursorAt(i);
+            try std.testing.expect(d.cursors[i] != null);
+        }
+        for (0..n) |i| {
+            const src = d.frameSource(i);
+            var waited: usize = 0;
+            while (!src.ready()) : (waited += 1) {
+                if (waited > 100) return error.TestTimeout;
+                _ = try t.h.client.dispatchTimeout(20);
+            }
+            _ = src.take();
+            try src.request();
+        }
+    }
+
+    fn stop(t: *TestDesk) void {
+        const d = t.d;
+        d.entered = false; // no lock, no restore: the fakes are left as they are
+        for (0..d.plan.count) |i| {
+            if (d.captureSlot(i).*) |cap| cap.deinit();
+            d.captureSlot(i).* = null;
+            d.stopCursorAt(i);
+        }
+        d.client = null; // the harness's
+        d.destroy();
+        t.hy.destroy();
+        t.h.stop() catch |e| std.debug.panic("fake compositor: {t}", .{e});
+    }
+
+    /// `first` journaled before `then`.
+    fn expectBefore(t: *TestDesk, first: []const u8, then: []const u8) !void {
+        const a = t.journal.find(first);
+        const b = t.journal.find(then);
+        if (a != null and b != null and a.? < b.?) return;
+        std.debug.print("expected `{s}` before `{s}`; journal:\n", .{ first, then });
+        t.journal.dump();
+        return error.TestUnexpectedOrder;
+    }
+};
+
+test "relayout to fewer outputs stops their captures and cursor sessions before it removes them" {
+    var t: TestDesk = .{};
+    try t.start(3);
+    defer t.stop();
+    var one = TestDesk.layoutOf(1);
+    try t.d.relayout(&one);
+    try std.testing.expectEqual(1, t.d.outputCount());
+    for ([_][]const u8{ "RDP-2", "RDP-3" }) |name| {
+        var buf: [3][64]u8 = undefined;
+        const removed = try std.fmt.bufPrint(&buf[0], "ipc output remove {s}", .{name});
+        try t.expectBefore(try std.fmt.bufPrint(&buf[1], "destroy session {s}", .{name}), removed);
+        try t.expectBefore(try std.fmt.bufPrint(&buf[2], "destroy cursor session {s}", .{name}), removed);
+    }
+    // RDP-1 still captured; no request reached a stopped session.
+    try std.testing.expect(t.d.captureAt(0) != null);
+    try std.testing.expect(t.journal.find("destroy session RDP-1") == null);
+    try std.testing.expectEqual(0, t.h.fake.frames_after_stop.load(.acquire));
+}
+
+test "a desktop handed over has its captures stopped first" {
+    var t: TestDesk = .{};
+    try t.start(2);
+    defer t.stop();
+    t.d.parkForHandover();
+    for (0..2) |i| try std.testing.expect(t.d.captureAt(i) == null);
+    try std.testing.expect(t.journal.find("destroy session RDP-1") != null);
+    try std.testing.expect(t.journal.find("destroy session RDP-2") != null);
+    try std.testing.expectEqual(0, t.h.fake.frames_after_stop.load(.acquire));
+}
+
+test "a desktop whose enter failed is restored without a lock" {
+    // A keymap failure in enter(), after the physical monitors went off, must not leave them off
+    // behind a lock the client never saw.
+    var t: TestDesk = .{};
+    try t.start(1);
+    defer t.stop();
+    const d = t.d;
+    try std.testing.expect(d.entered and !d.live);
+    // The Wayland side as leave() finds it, minus the harness's client (stop() closes it).
+    if (d.captureSlot(0).*) |cap| cap.deinit();
+    d.captureSlot(0).* = null;
+    d.stopCursorAt(0);
+    d.client = null;
+    d.leave();
+    try std.testing.expect(!d.entered);
+    try std.testing.expect(t.journal.find("ipc output remove RDP-1") != null);
 }

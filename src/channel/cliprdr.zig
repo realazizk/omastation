@@ -743,7 +743,8 @@ pub const bitmap_file_header_len = 14; // BITMAPFILEHEADER
 pub const LCS_sRGB: u32 = 0x73524742;
 pub const LCS_GM_IMAGES: u32 = 0x00000004;
 
-/// BITMAPINFOHEADER/V4/V5, 1 to 32 bpp, BI_RGB or BI_BITFIELDS; biSizeImage is not trusted.
+/// BITMAPINFOHEADER/V4/V5, 1 to 32 bpp, BI_RGB or BI_BITFIELDS, or FreeRDP's 48 and 64 bpp
+/// BI_RGB (16-bit samples keep their high byte); biSizeImage is not trusted.
 pub fn decodeDib(gpa: Allocator, dib: []const u8) Error!Image {
     return image_impl.decodeDib(gpa, dib);
 }
@@ -1085,7 +1086,7 @@ pub const Event = union(enum) {
     data_request: u32,
     /// Answer to requestData.
     data_response: struct { format_id: u32, ok: bool, data: []const u8 },
-    /// Answer with sendFileContents or sendFileSize.
+    /// Answer with sendFileContents or sendFileSize, from the files Server.fileContentsLock picks.
     file_contents_request: FileContentsRequest,
     file_contents_response: FileContentsResponse,
     /// The client locks / unlocks local file stream data (3.1.5.3.2, 3.1.5.3.4).
@@ -1306,6 +1307,14 @@ pub const Server = struct {
         s.data_request = null;
     }
 
+    /// The clipDataId whose locked files serve `req`, or null for the current local list
+    /// (3.1.5.4.6). A clipDataId names data a Lock Clipboard Data PDU tagged (2.2.5.3), and
+    /// nothing is locked without CB_CAN_LOCK_CLIPDATA (2.2.2.1.1.1): FreeRDP sends one anyway.
+    pub fn fileContentsLock(s: *const Server, req: FileContentsRequest) ?u32 {
+        if (s.negotiated & CB_CAN_LOCK_CLIPDATA == 0) return null;
+        return req.clip_data_id;
+    }
+
     /// A late response is ignored.
     pub fn cancelFileContentsRequest(s: *Server, stream_id: u32) void {
         const i = std.mem.indexOfScalar(u32, s.our_streams.items, stream_id) orelse return;
@@ -1336,6 +1345,7 @@ pub const Server = struct {
             .format_list_response => s.responses_due > 0,
             .format_data_response => s.data_request != null,
             .filecontents_response => s.our_streams.items.len > 0,
+            // FreeRDP locks when the server can, whatever it negotiated: ignored without it.
             .lock_clipdata, .unlock_clipdata => s.negotiated & CB_CAN_LOCK_CLIPDATA != 0,
             .monitor_ready => false,
             _ => false,
@@ -1423,7 +1433,7 @@ pub const Server = struct {
     fn canServeFileContents(s: *const Server, req: FileContentsRequest) bool {
         if (s.negotiated & CB_STREAM_FILECLIP_ENABLED == 0) return false;
         if (s.negotiated & CB_HUGE_FILE_SUPPORT_ENABLED == 0 and req.position >> 32 != 0) return false;
-        if (req.clip_data_id) |id| return std.mem.indexOfScalar(u32, s.client_locks.items, id) != null;
+        if (s.fileContentsLock(req)) |id| return std.mem.indexOfScalar(u32, s.client_locks.items, id) != null;
         return !s.local_failed and s.localHasFiles();
     }
 };
@@ -1597,4 +1607,97 @@ fn latin1ToUtf8Alloc(gpa: Allocator, b: []const u8) Allocator.Error![]u8 {
     errdefer out.deinit(gpa);
     for (b) |ch| try text_impl.appendUtf8(gpa, &out, ch);
     return out.toOwnedSlice(gpa);
+}
+
+/// A server past initialization whose local Format List offers files, and a client to drive it.
+const TestPeer = struct {
+    s: Server,
+    out: std.ArrayList(u8) = .empty,
+    pdu: std.ArrayList(u8) = .empty,
+
+    fn init(client_flags: u32) !TestPeer {
+        var t: TestPeer = .{ .s = Server.init(std.testing.allocator, .{}) };
+        errdefer t.deinit();
+        try t.s.start(&t.out);
+        _ = try t.send(encodeCaps, .{GeneralCapability{ .flags = client_flags }});
+        _ = try t.send(encodeFormatList, .{ &[_]Format{}, NameEncoding.long });
+        try t.s.setLocalFormats(&.{.{ .id = local_id_file_group_descriptor_w, .name = name_file_group_descriptor_w }}, &t.out);
+        _ = try t.send(encodeFormatListResponse, .{true});
+        return t;
+    }
+
+    fn deinit(t: *TestPeer) void {
+        t.s.deinit();
+        t.out.deinit(std.testing.allocator);
+        t.pdu.deinit(std.testing.allocator);
+    }
+
+    /// The client PDU `encode` writes with `args`; `out` keeps only what the server answers.
+    fn send(t: *TestPeer, comptime encode: anytype, args: anytype) !Event {
+        t.pdu.clearRetainingCapacity();
+        t.out.clearRetainingCapacity();
+        var w = bytes.Writer.init(&t.pdu, std.testing.allocator);
+        try @call(.auto, encode, .{&w} ++ args);
+        return t.s.handle(t.pdu.items, &t.out);
+    }
+
+    fn contents(t: *TestPeer, clip_data_id: ?u32) !Event {
+        return t.send(encodeFileContentsRequest, .{FileContentsRequest{ .stream_id = 1, .lindex = 0, .flags = FILECONTENTS_SIZE, .cb_requested = 8, .clip_data_id = clip_data_id }});
+    }
+
+    /// The server failed the request: a CB_RESPONSE_FAIL File Contents Response is queued.
+    fn failed(t: *const TestPeer) !bool {
+        if (t.out.items.len == 0) return false;
+        return !(try decodeFileContentsResponse(t.out.items)).ok;
+    }
+};
+
+/// FreeRDP 3's generalFlags: no CB_CAN_LOCK_CLIPDATA.
+const freerdp_flags = CB_USE_LONG_FORMAT_NAMES | CB_STREAM_FILECLIP_ENABLED | CB_FILECLIP_NO_FILE_PATHS | CB_HUGE_FILE_SUPPORT_ENABLED;
+
+test "a client without CB_CAN_LOCK_CLIPDATA still gets file contents for its clipDataId" {
+    // FreeRDP locks the File List because the server can, then names that lock in every request.
+    var t = try TestPeer.init(freerdp_flags);
+    defer t.deinit();
+    try std.testing.expectEqual(@as(u32, 0x2e), t.s.negotiatedFlags());
+    try std.testing.expect(try t.send(encodeLockClipdata, .{2}) == .none);
+    try std.testing.expectEqual(@as(usize, 0), t.out.items.len);
+    const ev = try t.contents(2);
+    try std.testing.expect(ev == .file_contents_request);
+    try std.testing.expect(!try t.failed());
+    try std.testing.expectEqual(@as(?u32, 2), ev.file_contents_request.clip_data_id);
+    try std.testing.expectEqual(@as(?u32, null), t.s.fileContentsLock(ev.file_contents_request));
+    try t.s.sendFileSize(1, 5, &t.out);
+    // Unlock changes nothing either; requests still get the current list.
+    try std.testing.expect(try t.send(encodeUnlockClipdata, .{2}) == .none);
+    try std.testing.expectEqual(@as(usize, 0), t.out.items.len);
+    try std.testing.expect(try t.contents(7) == .file_contents_request);
+    try t.s.sendFileSize(1, 5, &t.out);
+    // Without files in the current list there is nothing to serve.
+    try t.s.setLocalFormats(&.{}, &t.out);
+    try std.testing.expect(try t.contents(2) == .none);
+    try std.testing.expect(try t.failed());
+}
+
+test "with CB_CAN_LOCK_CLIPDATA a File Contents Request is served by its lock only" {
+    var t = try TestPeer.init(freerdp_flags | CB_CAN_LOCK_CLIPDATA);
+    defer t.deinit();
+    try std.testing.expectEqual(all_general_flags, t.s.negotiatedFlags());
+    try std.testing.expectEqual(@as(u32, 2), (try t.send(encodeLockClipdata, .{2})).lock);
+    const ev = try t.contents(2);
+    try std.testing.expect(ev == .file_contents_request);
+    try std.testing.expectEqual(@as(?u32, 2), t.s.fileContentsLock(ev.file_contents_request));
+    try t.s.sendFileSize(1, 5, &t.out);
+    // An id never locked fails.
+    try std.testing.expect(try t.contents(9) == .none);
+    try std.testing.expect(try t.failed());
+    // Locked data outlives the local list; requests without an id follow the list.
+    try t.s.setLocalFormats(&.{}, &t.out);
+    try std.testing.expect(try t.contents(2) == .file_contents_request);
+    try t.s.sendFileSize(1, 5, &t.out);
+    try std.testing.expect(try t.contents(null) == .none);
+    try std.testing.expect(try t.failed());
+    try std.testing.expectEqual(@as(u32, 2), (try t.send(encodeUnlockClipdata, .{2})).unlock);
+    try std.testing.expect(try t.contents(2) == .none);
+    try std.testing.expect(try t.failed());
 }

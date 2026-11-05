@@ -211,7 +211,7 @@ pub fn pump(c: *Conn, d: *Desktop) Error!bool {
         {
             enter(c, i);
             defer leave(c, i);
-            channels.sendDesktopFrame(c, f) catch |err| switch (err) {
+            channels.sendDesktopFrame(c, f, src.gpu()) catch |err| switch (err) {
                 // A malformed frame is skipped; the client keeps its picture.
                 error.InvalidDimensions => log.warn("{s}: skipping a {d}x{d} frame of {s} with stride {d} and {d} bytes", .{ c.peer, f.width, f.height, info.name, f.stride, f.data.len }),
                 else => return err,
@@ -258,6 +258,12 @@ fn pumpComposite(c: *Conn, d: *Desktop) Error!bool {
     for (0..plan.count) |i| {
         const src = d.frameSource(i);
         const f = src.take() orelse continue;
+        if (f.dmabuf != null) {
+            // The composite is built on the CPU: shm for this output.
+            if (src.gpu()) |g| g.out.fallBack(g.cap, &c.enc, "outputs composited for bitmap updates", .{});
+            try src.request();
+            continue;
+        }
         blit(c, f, plan.outputs[i].origin_x, plan.outputs[i].origin_y);
         try src.request();
         any = true;
@@ -279,7 +285,7 @@ fn pumpComposite(c: *Conn, d: *Desktop) Error!bool {
     };
     s.inside = true;
     defer s.inside = false;
-    try channels.sendDesktopFrame(c, &frame);
+    try channels.sendDesktopFrame(c, &frame, null);
     return true;
 }
 

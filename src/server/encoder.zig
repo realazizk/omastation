@@ -7,7 +7,13 @@ const gfx = @import("../proto/gfx.zig");
 const planar = @import("../codec/planar.zig");
 const workers = @import("../codec/workers.zig");
 
+const log = std.log.scoped(.enc);
+
 pub const tile: u32 = 64;
+
+/// The shadow's allocation is page-aligned and a whole number of pages, so GPU capture can import
+/// it as host memory and write changed tiles straight into it (src/gpu/capture.zig).
+pub const shadow_align: usize = 4096;
 
 pub const Encoder = struct {
     gpa: std.mem.Allocator,
@@ -15,6 +21,19 @@ pub const Encoder = struct {
     height: u32 = 0,
     /// What the client shows, `width * 4` bytes per row (BGRX).
     shadow: []u8 = &.{},
+    /// The allocation `shadow` starts; `shadow_gen` counts allocations (each a new address range).
+    shadow_mem: []align(shadow_align) u8 = &.{},
+    shadow_gen: u32 = 0,
+    /// Called once, just before the shadow's allocation is freed (a new size, deinit): GPU capture
+    /// imported it into Vulkan and must let go of it first (a driver may refuse every later
+    /// submission while an import's memory is gone).
+    shadow_release: ?ShadowRelease = null,
+    /// Tiles whose shadow pixels lag the screen: GPU capture left them on the GPU (lazy readback,
+    /// tiles H.264 codes from there). `freshen` brings them in before anything reads them.
+    stale: std.DynamicBitSetUnmanaged = .{},
+    freshener: ?Freshener = null,
+    /// Scratch: the tiles one freshen brings in.
+    fresh_tiles: std.ArrayList(u32) = .empty,
     /// False until the client has been sent a whole frame of this size.
     valid: bool = false,
     bitmap: std.ArrayList(u8) = .empty,
@@ -35,8 +54,34 @@ pub const Encoder = struct {
     /// `diff` scratch: per tile row, the runs found there (at most `runsPerRow`) and their count.
     row_runs: []Run = &.{},
     row_n: []u32 = &.{},
+    /// `diff` scratch: per tile, its first pixel row that differs from the shadow, or `unchanged`.
+    tile_top: []u8 = &.{},
+    /// Which GPU change detector last brought the shadow up to date (src/gpu/capture.zig);
+    /// 0 when `diff` did. That detector's reference frame is the shadow only while it matches.
+    gpu_token: u64 = 0,
 
     const Run = struct { rect: gfx.Rect16, tight: gfx.Rect16 };
+
+    /// Called with the encoder whose shadow is about to go.
+    pub const ShadowRelease = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, e: *const Encoder) void,
+    };
+
+    /// Copies the current pixels of `tiles` (indices) into the shadow; false if it cannot.
+    pub const Freshener = struct {
+        ctx: *anyopaque,
+        func: *const fn (ctx: *anyopaque, e: *Encoder, tiles: []const u32) bool,
+    };
+
+    /// Lets go of the GPU capture links before the shadow is freed: the import first, and the
+    /// freshener with it (it served this shadow).
+    pub fn releaseShadow(e: *Encoder) void {
+        e.freshener = null;
+        const r = e.shadow_release orelse return;
+        e.shadow_release = null;
+        r.func(r.ctx, e);
+    }
 
     pub fn init(gpa: std.mem.Allocator) Encoder {
         return .{ .gpa = gpa };
@@ -46,11 +91,15 @@ pub const Encoder = struct {
         e.bufs.deinit(e.gpa);
         e.gpa.free(e.row_runs);
         e.gpa.free(e.row_n);
+        e.gpa.free(e.tile_top);
         e.gpa.free(e.changed_ms);
         e.gpa.free(e.lossy_qp);
         e.owed.deinit(e.gpa);
+        e.stale.deinit(e.gpa);
+        e.fresh_tiles.deinit(e.gpa);
         e.lossy.deinit(e.gpa);
-        e.gpa.free(e.shadow);
+        e.releaseShadow();
+        e.gpa.free(e.shadow_mem);
         e.bitmap.deinit(e.gpa);
         e.rects.deinit(e.gpa);
         e.tight.deinit(e.gpa);
@@ -59,7 +108,8 @@ pub const Encoder = struct {
     /// Sets a new surface size; the next frame is sent whole. On OutOfMemory the old size is kept.
     pub fn reset(e: *Encoder, w: u32, h: u32) !void {
         if (w != e.width or h != e.height) {
-            const shadow = try e.gpa.alloc(u8, @as(usize, w) * h * 4);
+            const len = @as(usize, w) * h * 4;
+            const shadow = try e.gpa.alignedAlloc(u8, .fromByteUnits(shadow_align), std.mem.alignForward(usize, len, shadow_align));
             errdefer e.gpa.free(shadow);
             const tiles = tilesFor(w) * tilesFor(h);
             const changed = try e.gpa.alloc(i64, tiles);
@@ -70,9 +120,12 @@ pub const Encoder = struct {
             errdefer e.gpa.free(runs);
             const row_n = try e.gpa.alloc(u32, tilesFor(h));
             errdefer e.gpa.free(row_n);
+            const tile_top = try e.gpa.alloc(u8, tiles);
+            errdefer e.gpa.free(tile_top);
             // Grow `owed` first: if `lossy` then fails, `owed` is merely oversized.
             if (tiles > e.owed.bit_length) try e.owed.resize(e.gpa, tiles, false);
             try e.lossy.resize(e.gpa, tiles, false);
+            try e.stale.resize(e.gpa, tiles, false);
             try e.owed.resize(e.gpa, tiles, false);
             e.gpa.free(e.changed_ms);
             e.changed_ms = changed;
@@ -82,12 +135,18 @@ pub const Encoder = struct {
             e.row_runs = runs;
             e.gpa.free(e.row_n);
             e.row_n = row_n;
-            e.gpa.free(e.shadow);
-            e.shadow = shadow;
+            e.gpa.free(e.tile_top);
+            e.tile_top = tile_top;
+            e.releaseShadow();
+            e.gpa.free(e.shadow_mem);
+            e.shadow_mem = shadow;
+            e.shadow = shadow[0..len];
+            e.shadow_gen +%= 1;
             e.width = w;
             e.height = h;
         }
         e.lossy.unsetAll();
+        e.stale.unsetAll();
         e.owed.unsetAll();
         @memset(e.changed_ms, 0);
         @memset(e.lossy_qp, lossy_other);
@@ -406,7 +465,7 @@ pub const Encoder = struct {
                 j.e.diffRow(j.pixels, j.stride, @intCast(ty), j.e.row_runs[ty * j.per ..][0..j.per], &j.e.row_n[ty]);
             }
         };
-        workers.forEach(tiles_y, Job{ .e = e, .pixels = pixels, .stride = stride, .per = per }, Job.run);
+        workers.forEachStreaming(tiles_y, Job{ .e = e, .pixels = pixels, .stride = stride, .per = per }, Job.run);
         for (0..tiles_y) |ty| for (e.row_runs[ty * per ..][0..e.row_n[ty]]) |r| {
             e.rects.appendAssumeCapacity(r.rect);
             e.tight.appendAssumeCapacity(r.tight);
@@ -414,6 +473,7 @@ pub const Encoder = struct {
         // A whole frame covers whatever was owed.
         if (!e.valid) e.owed.unsetAll();
         e.valid = true;
+        e.stale.unsetAll();
         return e.rects.items.len;
     }
 
@@ -422,12 +482,14 @@ pub const Encoder = struct {
         const tiles_x = tilesFor(e.width);
         const y0 = ty * tile;
         const th = @min(tile, e.height - y0);
+        const tops = e.tile_top[ty * tiles_x ..][0..tiles_x];
+        if (e.valid) e.firstChangedRows(pixels, stride, y0, th, tops);
         var count: u32 = 0;
         var run_start: ?u32 = null;
         var run_box: gfx.Rect16 = undefined;
         var tx: u32 = 0;
         while (tx <= tiles_x) : (tx += 1) {
-            const box: ?gfx.Rect16 = if (tx == tiles_x) null else if (!e.valid) tileRect(e, tx, y0, th) else e.changedBox(pixels, stride, tx * tile, y0, th);
+            const box: ?gfx.Rect16 = if (tx == tiles_x) null else if (!e.valid) tileRect(e, tx, y0, th) else e.changedBox(pixels, stride, tx * tile, y0, th, tops[tx]);
             if (box) |b| {
                 run_box = if (run_start == null) b else union16(run_box, b);
                 if (run_start == null) run_start = tx;
@@ -438,11 +500,209 @@ pub const Encoder = struct {
             const x0 = start * tile;
             const x1 = @min(tx * tile, e.width);
             runs[count] = .{ .rect = .{ .left = @intCast(x0), .top = @intCast(y0), .right = @intCast(x1), .bottom = @intCast(y0 + th) }, .tight = run_box };
+            // Runs do not overlap and this row's comparisons are done: the run's pixel rows from its
+            // first to its last changed one are copied (the rows outside them already match).
+            e.copyToShadow(pixels, stride, x0, run_box.top, x1 - x0, run_box.bottom - run_box.top);
             count += 1;
         }
-        // Runs do not overlap, so copying after the row's comparisons is safe.
-        for (runs[0..count]) |r| e.copyToShadow(pixels, stride, r.rect.left, r.rect.top, r.rect.right - r.rect.left, r.rect.bottom - r.rect.top);
         n.* = count;
+    }
+
+    const unchanged: u8 = 0xFF;
+
+    const Vec = @Vector(32, u8);
+    const vec_len = @sizeOf(Vec);
+
+    /// Per tile of the band at `y0` (`th` pixel rows), its first pixel row that differs from the
+    /// shadow, or `unchanged`. Rows are scanned whole, left to right, so both buffers are read front
+    /// to back; a tile is no longer compared once it differs, and the scan stops when all do.
+    fn firstChangedRows(e: *const Encoder, pixels: []const u8, stride: usize, y0: u32, th: u32, tops: []u8) void {
+        @memset(tops, unchanged);
+        const sstride = @as(usize, e.width) * 4;
+        const full: usize = e.width / tile;
+        const rest: usize = @as(usize, e.width % tile) * 4;
+        var open = tops.len;
+        for (0..th) |r| {
+            const y = @as(usize, y0) + r;
+            const a = pixels[y * stride ..][0..sstride];
+            const b = e.shadow[y * sstride ..][0..sstride];
+            for (0..full) |tx| {
+                if (tops[tx] == unchanged and differs(a[tx * tile * 4 ..][0 .. tile * 4], b[tx * tile * 4 ..][0 .. tile * 4])) {
+                    tops[tx] = @intCast(r);
+                    open -= 1;
+                }
+            }
+            if (rest != 0 and tops[full] == unchanged and !std.mem.eql(u8, a[full * tile * 4 ..][0..rest], b[full * tile * 4 ..][0..rest])) {
+                tops[full] = @intCast(r);
+                open -= 1;
+            }
+            if (open == 0) break;
+        }
+    }
+
+    /// Whether one full tile row (64 pixels) differs: wide XORs folded together, one test at the end.
+    inline fn differs(a: *const [tile * 4]u8, b: *const [tile * 4]u8) bool {
+        var acc: Vec = @splat(0);
+        inline for (0..tile * 4 / vec_len) |i| {
+            const va: Vec = a[i * vec_len ..][0..vec_len].*;
+            const vb: Vec = b[i * vec_len ..][0..vec_len].*;
+            acc |= va ^ vb;
+        }
+        return @reduce(.Or, acc) != 0;
+    }
+
+    /// First pixel before `limit` where the rows differ, else `limit`.
+    fn firstDiff(a: []const u8, b: []const u8, limit: u32) u32 {
+        var x: u32 = 0;
+        while (x + vec_len / 4 <= limit) : (x += vec_len / 4) {
+            const va: Vec = a[x * 4 ..][0..vec_len].*;
+            const vb: Vec = b[x * 4 ..][0..vec_len].*;
+            const ne: u32 = @bitCast(va != vb);
+            if (ne != 0) return x + @ctz(ne) / 4;
+        }
+        while (x < limit) : (x += 1) {
+            if (!std.mem.eql(u8, a[x * 4 ..][0..4], b[x * 4 ..][0..4])) return x;
+        }
+        return limit;
+    }
+
+    /// One past the last pixel at or after `floor` where the rows (`w` pixels) differ, else `floor`.
+    fn lastDiff(a: []const u8, b: []const u8, w: u32, floor: u32) u32 {
+        var x: u32 = w;
+        while (x >= floor + vec_len / 4) : (x -= vec_len / 4) {
+            const s = (x - vec_len / 4) * 4;
+            const va: Vec = a[s..][0..vec_len].*;
+            const vb: Vec = b[s..][0..vec_len].*;
+            const ne: u32 = @bitCast(va != vb);
+            if (ne != 0) return x - @clz(ne) / 4;
+        }
+        while (x > floor) : (x -= 1) {
+            if (!std.mem.eql(u8, a[(x - 1) * 4 ..][0..4], b[(x - 1) * 4 ..][0..4])) return x;
+        }
+        return floor;
+    }
+
+    /// Like `diff`, from per-tile changes found elsewhere (the GPU, src/gpu/tilediff.zig): for
+    /// tile (tx, ty), `boxes[ty * tilesX + tx]` is the box of its changed pixels relative to the
+    /// tile (left, top, right, bottom; right == 0: unchanged), and `pixels` holds at least the
+    /// changed tiles. Gives the rects, tight boxes and shadow `diff` gives for a frame that equals
+    /// the shadow outside those boxes. Needs a valid shadow (an invalid one goes through `diff`)
+    /// and a box per tile. On OutOfMemory the shadow is untouched.
+    pub fn applyTileDiff(e: *Encoder, boxes: []const [4]u32, pixels: []const u8, stride: usize) !usize {
+        try e.reserveDiff();
+        return e.tileRuns(boxes, .{ .pixels = pixels, .stride = stride });
+    }
+
+    /// `applyTileDiff` for changed tiles already written into the shadow (by the GPU); needs
+    /// `reserveDiff` first, then cannot fail.
+    pub fn applyTileDiffInShadow(e: *Encoder, boxes: []const [4]u32) usize {
+        return e.tileRuns(boxes, null);
+    }
+
+    /// Room for any frame's runs, so the tile-change entry points need no allocation.
+    pub fn reserveDiff(e: *Encoder) !void {
+        const per = runsPerRow(e.width);
+        try e.rects.ensureTotalCapacity(e.gpa, per * e.tilesY());
+        try e.tight.ensureTotalCapacity(e.gpa, per * e.tilesY());
+    }
+
+    pub fn hasStale(e: *const Encoder) bool {
+        return e.stale.bit_length > 0 and e.stale.findFirstSet() != null;
+    }
+
+    pub fn markStale(e: *Encoder, tile_index: usize) void {
+        e.stale.set(tile_index);
+    }
+
+    /// Brings the stale tiles under `rects` into the shadow before something reads them there,
+    /// in one pass. Without a freshener, or when it fails, the client gets a whole frame next
+    /// (the shadow cannot be trusted).
+    pub fn freshen(e: *Encoder, rects: []const gfx.Rect16) !void {
+        if (!e.hasStale()) return;
+        const list = &e.fresh_tiles;
+        list.clearRetainingCapacity();
+        // Out of memory midway: the tiles taken stay stale.
+        errdefer for (list.items) |i| e.stale.set(i);
+        const tx_n = e.tilesX();
+        for (rects) |r| {
+            if (r.right <= r.left or r.bottom <= r.top) continue;
+            var ty: u32 = r.top / tile;
+            while (ty * tile < r.bottom) : (ty += 1) {
+                var tx: u32 = r.left / tile;
+                while (tx * tile < r.right) : (tx += 1) {
+                    const i = ty * tx_n + tx;
+                    if (!e.stale.isSet(i)) continue;
+                    try list.append(e.gpa, i);
+                    e.stale.unset(i);
+                }
+            }
+        }
+        if (list.items.len == 0) return;
+        e.refresh(list.items);
+    }
+
+    /// Every stale tile into the shadow (before a CPU diff compares with it, or a full refresh).
+    pub fn freshenAll(e: *Encoder) !void {
+        if (!e.hasStale()) return;
+        const list = &e.fresh_tiles;
+        list.clearRetainingCapacity();
+        var it = e.stale.iterator(.{});
+        while (it.next()) |i| try list.append(e.gpa, @intCast(i));
+        e.stale.unsetAll();
+        e.refresh(list.items);
+    }
+
+    fn refresh(e: *Encoder, tiles: []const u32) void {
+        if (e.freshener) |f| if (f.func(f.ctx, e, tiles)) return;
+        log.warn("{d} tiles could not be brought into the shadow: the next frame is whole", .{tiles.len});
+        e.invalidate();
+    }
+
+    const Copy = struct { pixels: []const u8, stride: usize };
+
+    fn tileRuns(e: *Encoder, boxes: []const [4]u32, copy: ?Copy) usize {
+        std.debug.assert(e.valid and boxes.len == @as(usize, e.tilesX()) * e.tilesY());
+        e.rects.clearRetainingCapacity();
+        e.tight.clearRetainingCapacity();
+        const tiles_x = e.tilesX();
+        const tiles_y = e.tilesY();
+        var ty: u32 = 0;
+        while (ty < tiles_y) : (ty += 1) {
+            const y0 = ty * tile;
+            const th = @min(tile, e.height - y0);
+            const first = e.rects.items.len;
+            var run_start: ?u32 = null;
+            var run_box: gfx.Rect16 = undefined;
+            var tx: u32 = 0;
+            while (tx <= tiles_x) : (tx += 1) {
+                const box: ?gfx.Rect16 = if (tx == tiles_x) null else e.boxIn(boxes[ty * tiles_x + tx], tx * tile, y0, th);
+                if (box) |b| {
+                    // Its pixels reach the shadow (copied here, or written by the GPU).
+                    e.stale.unset(ty * tiles_x + tx);
+                    run_box = if (run_start == null) b else union16(run_box, b);
+                    if (run_start == null) run_start = tx;
+                    continue;
+                }
+                const start = run_start orelse continue;
+                run_start = null;
+                e.rects.appendAssumeCapacity(.{ .left = @intCast(start * tile), .top = @intCast(y0), .right = @intCast(@min(tx * tile, e.width)), .bottom = @intCast(y0 + th) });
+                e.tight.appendAssumeCapacity(run_box);
+            }
+            if (copy) |cp| for (e.rects.items[first..]) |r| e.copyToShadow(cp.pixels, cp.stride, r.left, r.top, r.right - r.left, r.bottom - r.top);
+        }
+        return e.rects.items.len;
+    }
+
+    /// A tile's changed box in surface coordinates, clipped to the tile; null when unchanged.
+    fn boxIn(e: *const Encoder, b: [4]u32, x0: u32, y0: u32, th: u32) ?gfx.Rect16 {
+        if (b[2] == 0) return null;
+        const tw = @min(tile, e.width - x0);
+        const right = @min(b[2], tw);
+        const bottom = @min(b[3], th);
+        const left = @min(b[0], right -| 1);
+        const top = @min(b[1], bottom -| 1);
+        if (bottom == 0) return null;
+        return .{ .left = @intCast(x0 + left), .top = @intCast(y0 + top), .right = @intCast(x0 + right), .bottom = @intCast(y0 + bottom) };
     }
 
     /// `diff`, then planar WireToSurface1 PDUs for the changed regions.
@@ -466,12 +726,14 @@ pub const Encoder = struct {
     }
 
     pub fn writePlanar(e: *Encoder, w: *bytes.Writer, surface_id: u16) !void {
+        try e.freshen(e.rects.items);
         try e.bufs.ensure(e.gpa, e.rects.items.len);
         try e.encodePlanarRects(e.rects.items, e.bufs.items);
         for (e.rects.items, e.bufs.items[0..e.rects.items.len]) |r, *b| try writePlanarPayload(w, surface_id, r, b.items);
     }
 
     pub fn writePlanarRect(e: *Encoder, w: *bytes.Writer, surface_id: u16, r: gfx.Rect16) !void {
+        try e.freshen(&.{r});
         e.bitmap.clearRetainingCapacity();
         try e.encodePlanarRect(&e.bitmap, r);
         try writePlanarPayload(w, surface_id, r, e.bitmap.items);
@@ -527,32 +789,35 @@ pub const Encoder = struct {
         return .{ .left = @intCast(x0), .top = @intCast(y0), .right = @intCast(@min(x0 + tile, e.width)), .bottom = @intCast(y0 + th) };
     }
 
-    fn changedBox(e: *const Encoder, pixels: []const u8, stride: usize, x0: u32, y0: u32, th: u32) ?gfx.Rect16 {
+    /// Bounding box of the changed pixels of the tile at (`x0`, `y0`) (`th` pixel rows) whose first
+    /// differing row is `top` (`firstChangedRows`), or null when it is `unchanged`. The last
+    /// differing row is found from the bottom; the sides are searched in the rows between until the
+    /// box spans the tile (rows that match change neither side).
+    fn changedBox(e: *const Encoder, pixels: []const u8, stride: usize, x0: u32, y0: u32, th: u32, top: u8) ?gfx.Rect16 {
+        if (top == unchanged) return null;
         const tw = @min(tile, e.width - x0);
         const sstride = @as(usize, e.width) * 4;
         const off = @as(usize, x0) * 4;
         const len = @as(usize, tw) * 4;
-        var top: ?u32 = null;
-        var bottom: u32 = 0;
+        var bottom: u32 = th;
+        while (bottom > @as(u32, top) + 1) : (bottom -= 1) {
+            const y = @as(usize, y0 + bottom - 1);
+            const a = pixels[y * stride + off ..][0..len];
+            const b = e.shadow[y * sstride + off ..][0..len];
+            const differ = if (tw == tile) differs(a[0 .. tile * 4], b[0 .. tile * 4]) else !std.mem.eql(u8, a, b);
+            if (differ) break;
+        }
         var left: u32 = tw;
         var right: u32 = 0;
-        var r: u32 = 0;
-        while (r < th) : (r += 1) {
+        var r: u32 = top;
+        while (r < bottom and (left != 0 or right != tw)) : (r += 1) {
             const y = @as(usize, y0 + r);
             const a = pixels[y * stride + off ..][0..len];
             const b = e.shadow[y * sstride + off ..][0..len];
-            if (std.mem.eql(u8, a, b)) continue;
-            if (top == null) top = r;
-            bottom = r + 1;
-            var lx: u32 = 0;
-            while (lx < left and std.mem.eql(u8, a[lx * 4 ..][0..4], b[lx * 4 ..][0..4])) lx += 1;
-            left = lx;
-            var rx: u32 = tw;
-            while (rx > right and std.mem.eql(u8, a[(rx - 1) * 4 ..][0..4], b[(rx - 1) * 4 ..][0..4])) rx -= 1;
-            right = rx;
+            if (left != 0) left = firstDiff(a, b, left);
+            if (right != tw) right = lastDiff(a, b, tw, right);
         }
-        const t = top orelse return null;
-        return .{ .left = @intCast(x0 + left), .top = @intCast(y0 + t), .right = @intCast(x0 + right), .bottom = @intCast(y0 + bottom) };
+        return .{ .left = @intCast(x0 + left), .top = @intCast(y0 + top), .right = @intCast(x0 + right), .bottom = @intCast(y0 + bottom) };
     }
 
     fn copyToShadow(e: *Encoder, pixels: []const u8, stride: usize, x0: u32, y0: u32, rw: u32, rh: u32) void {
@@ -633,6 +898,139 @@ test "diff on many tasks lists the same runs as on one" {
     }
     try std.testing.expect(lists[0].items.len > 20);
     try std.testing.expectEqualSlices(gfx.Rect16, lists[0].items, lists[1].items);
+}
+
+/// The plain tile compare: each tile on its own, row by row, the box widened pixel by pixel.
+/// The reference `firstChangedRows` and the wide compares must match exactly.
+const ReferenceDiff = struct {
+    width: u32,
+    height: u32,
+    shadow: []u8,
+    rects: std.ArrayList(gfx.Rect16) = .empty,
+    tight: std.ArrayList(gfx.Rect16) = .empty,
+
+    fn deinit(d: *ReferenceDiff, gpa: std.mem.Allocator) void {
+        d.rects.deinit(gpa);
+        d.tight.deinit(gpa);
+    }
+
+    fn box(d: *const ReferenceDiff, pixels: []const u8, stride: usize, x0: u32, y0: u32, th: u32) ?gfx.Rect16 {
+        const tw = @min(tile, d.width - x0);
+        const sstride = @as(usize, d.width) * 4;
+        const off = @as(usize, x0) * 4;
+        const len = @as(usize, tw) * 4;
+        var top: ?u32 = null;
+        var bottom: u32 = 0;
+        var left: u32 = tw;
+        var right: u32 = 0;
+        var r: u32 = 0;
+        while (r < th) : (r += 1) {
+            const y = @as(usize, y0 + r);
+            const a = pixels[y * stride + off ..][0..len];
+            const b = d.shadow[y * sstride + off ..][0..len];
+            if (std.mem.eql(u8, a, b)) continue;
+            if (top == null) top = r;
+            bottom = r + 1;
+            var lx: u32 = 0;
+            while (lx < left and std.mem.eql(u8, a[lx * 4 ..][0..4], b[lx * 4 ..][0..4])) lx += 1;
+            left = lx;
+            var rx: u32 = tw;
+            while (rx > right and std.mem.eql(u8, a[(rx - 1) * 4 ..][0..4], b[(rx - 1) * 4 ..][0..4])) rx -= 1;
+            right = rx;
+        }
+        const t = top orelse return null;
+        return .{ .left = @intCast(x0 + left), .top = @intCast(y0 + t), .right = @intCast(x0 + right), .bottom = @intCast(y0 + bottom) };
+    }
+
+    /// A diff of a valid shadow.
+    fn diff(d: *ReferenceDiff, gpa: std.mem.Allocator, pixels: []const u8, stride: usize) !void {
+        d.rects.clearRetainingCapacity();
+        d.tight.clearRetainingCapacity();
+        const tiles_x = (d.width + tile - 1) / tile;
+        var y0: u32 = 0;
+        while (y0 < d.height) : (y0 += tile) {
+            const th = @min(tile, d.height - y0);
+            var run_start: ?u32 = null;
+            var run_box: gfx.Rect16 = undefined;
+            const first = d.rects.items.len;
+            var tx: u32 = 0;
+            while (tx <= tiles_x) : (tx += 1) {
+                const b: ?gfx.Rect16 = if (tx == tiles_x) null else d.box(pixels, stride, tx * tile, y0, th);
+                if (b) |bx| {
+                    run_box = if (run_start == null) bx else union16(run_box, bx);
+                    if (run_start == null) run_start = tx;
+                    continue;
+                }
+                const start = run_start orelse continue;
+                run_start = null;
+                try d.rects.append(gpa, .{ .left = @intCast(start * tile), .top = @intCast(y0), .right = @intCast(@min(tx * tile, d.width)), .bottom = @intCast(y0 + th) });
+                try d.tight.append(gpa, run_box);
+            }
+            for (d.rects.items[first..]) |r| {
+                var y: usize = r.top;
+                while (y < r.bottom) : (y += 1) {
+                    const o = @as(usize, r.left) * 4;
+                    const n = @as(usize, r.right - r.left) * 4;
+                    @memcpy(d.shadow[y * d.width * 4 + o ..][0..n], pixels[y * stride + o ..][0..n]);
+                }
+            }
+        }
+    }
+};
+
+test "diff matches the per-tile reference: runs, tight boxes and shadow" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x0a5_7a71);
+    const rand = prng.random();
+    const sizes = [_][2]u32{ .{ 1, 1 }, .{ 7, 3 }, .{ 63, 65 }, .{ 64, 64 }, .{ 65, 129 }, .{ 200, 70 }, .{ 333, 200 }, .{ 1920, 130 } };
+    for (sizes) |size| {
+        const w = size[0];
+        const h = size[1];
+        const stride: usize = w * 4 + 28; // padded rows, like a real capture
+        const px = try testFrame(gpa, w, h, stride);
+        defer gpa.free(px);
+        var e = Encoder.init(gpa);
+        defer e.deinit();
+        try e.reset(w, h);
+        _ = try e.diff(px, stride);
+        var ref: ReferenceDiff = .{ .width = w, .height = h, .shadow = try gpa.dupe(u8, e.shadow) };
+        defer gpa.free(ref.shadow);
+        defer ref.deinit(gpa);
+        for (0..40) |frame| {
+            // Single pixels (any byte, tile edges included), boxes, whole rows, and still frames.
+            const kind = frame % 5;
+            const changes: usize = if (kind == 4) 0 else 1 + rand.uintLessThan(usize, 12);
+            for (0..changes) |_| {
+                const x = rand.uintLessThan(u32, w);
+                const y = rand.uintLessThan(u32, h);
+                switch (kind) {
+                    0 => px[y * stride + x * 4 + rand.uintLessThan(usize, 4)] +%= 1 + rand.uintLessThan(u8, 255),
+                    1 => {
+                        const bw = 1 + rand.uintLessThan(u32, @min(w - x, 90));
+                        const bh = 1 + rand.uintLessThan(u32, @min(h - y, 90));
+                        for (y..y + bh) |yy| for (x..x + bw) |xx| {
+                            px[yy * stride + xx * 4] +%= 3;
+                        };
+                    },
+                    2 => for (0..w) |xx| {
+                        px[y * stride + xx * 4 + 1] ^= 0x10;
+                    },
+                    3 => {
+                        // The edges of a tile: its first and last pixel of a row.
+                        const tx0 = (x / tile) * tile;
+                        px[y * stride + tx0 * 4 + 2] ^= 0x80;
+                        px[y * stride + @min(tx0 + tile, w) * 4 - 4] ^= 0x01;
+                    },
+                    else => {},
+                }
+            }
+            _ = try e.diff(px, stride);
+            try ref.diff(gpa, px, stride);
+            try std.testing.expectEqualSlices(gfx.Rect16, ref.rects.items, e.rects.items);
+            try std.testing.expectEqualSlices(gfx.Rect16, ref.tight.items, e.tight.items);
+            try std.testing.expectEqualSlices(u8, ref.shadow, e.shadow);
+        }
+    }
 }
 
 test "first frame is sent whole, then only changed tiles" {

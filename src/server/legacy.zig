@@ -224,6 +224,7 @@ fn lossyAllowed(c: *const Conn, p: codec_policy.Legacy) bool {
 }
 
 pub fn sendFrame(c: *Conn) conn_mod.Error!void {
+    try c.enc.freshenAll();
     const s = &c.ch.legacy;
     const p = policyOf(c);
     if (lossyAllowed(c, p)) {
@@ -239,6 +240,7 @@ pub fn sendFrame(c: *Conn) conn_mod.Error!void {
 
 /// Sends c.enc.rects losslessly from the shadow; on a paced link tiles past the byte budget are owed.
 pub fn sendLossless(c: *Conn) conn_mod.Error!void {
+    try c.enc.freshenAll();
     return sendLosslessLeaving(c, .owed);
 }
 
@@ -288,6 +290,7 @@ fn sendLosslessLeaving(c: *Conn, leftover: gfx_codecs.Leftover) conn_mod.Error!v
 
 /// Owed tiles go as soon as admitted; once the screen is quiet, lossy tiles are re-sent losslessly.
 pub fn refine(c: *Conn) conn_mod.Error!void {
+    try c.enc.freshenAll();
     if (c.output_suppressed or c.reactivating or !c.established) return;
     if (try refineStep(c) and (c.enc.hasOwed() or c.enc.hasLossy())) channels.lookAgain(c);
 }
