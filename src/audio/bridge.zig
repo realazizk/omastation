@@ -110,12 +110,51 @@ pub const StreamState = enum {
     retrying,
 };
 
+/// A failure retried every retry_ms (no audio system in reach): its first occurrence is logged,
+/// then at most once a minute with the count in between, and a success after it once.
+pub const RetryLog = struct {
+    failures: u32 = 0,
+    unlogged: u32 = 0,
+    last_ms: u64 = 0,
+    /// Failures logged (tests).
+    logged: u32 = 0,
+
+    pub const every_ms = 60_000;
+
+    /// Whether to log this failure: null, or the failures since the last logged one.
+    pub fn failed(r: *RetryLog, now_ms: u64) ?u32 {
+        r.failures += 1;
+        if (r.failures > 1 and now_ms -| r.last_ms < every_ms) {
+            r.unlogged += 1;
+            return null;
+        }
+        const n = r.unlogged;
+        r.unlogged = 0;
+        r.last_ms = now_ms;
+        r.logged += 1;
+        return n;
+    }
+
+    /// The failures before this success (0: nothing to say), and starts over.
+    pub fn succeeded(r: *RetryLog) u32 {
+        const n = r.failures;
+        r.* = .{ .logged = r.logged };
+        return n;
+    }
+};
+
 /// 20 ms of captured audio: 48 kHz S16 stereo interleaved.
 pub const Chunk = struct {
     pcm: [xch.chunk_samples]i16,
     /// When its first frame was captured (monotonic ms).
     ts_ms: u64,
 };
+
+/// ", still (N more ...)" after the first log of a repeated failure.
+fn again(buf: *[64]u8, n: u32) []const u8 {
+    if (n == 0) return "";
+    return std.fmt.bufPrint(buf, ", still ({d} more attempts in the last minute)", .{n}) catch "";
+}
 
 pub const Bridge = struct {
     gpa: Allocator,
@@ -141,6 +180,9 @@ pub const Bridge = struct {
 
     desk: StreamState = .off,
     desk_retry_at: u64 = 0,
+    capture_log: RetryLog = .{},
+    mic_log: RetryLog = .{},
+    desk_log: RetryLog = .{},
 
     pub fn init(gpa: Allocator, backend: Backend, cfg: Config) Error!Bridge {
         const chunks = std.math.divCeil(u32, @max(cfg.capture_max_ms, xch.chunk_ms), xch.chunk_ms) catch unreachable;
@@ -243,11 +285,14 @@ pub const Bridge = struct {
         self.capture_target = target;
         if (self.capture == .running) self.backend.stopCapture();
         self.backend.startCapture(target) catch |e| {
-            log.warn("cannot capture the desktop audio ({t}); retrying in {d} ms", .{ e, self.cfg.retry_ms });
+            var buf: [64]u8 = undefined;
+            if (self.capture_log.failed(now_ms)) |n| log.warn("cannot capture the desktop audio ({t}){s}; retrying every {d} ms", .{ e, again(&buf, n), self.cfg.retry_ms });
             self.capture = .retrying;
             self.capture_retry_at = now_ms +| self.cfg.retry_ms;
             return;
         };
+        const n = self.capture_log.succeeded();
+        if (n > 0) log.info("capturing the desktop audio after {d} failed attempt(s)", .{n});
         self.capture = .running;
     }
 
@@ -308,11 +353,14 @@ pub const Bridge = struct {
 
     fn applyDeskMute(self: *Bridge, now_ms: u64) void {
         self.backend.deskMute(.mute) catch |e| {
-            log.warn("cannot mute the desk's speakers ({t}); retrying in {d} ms", .{ e, self.cfg.retry_ms });
+            var buf: [64]u8 = undefined;
+            if (self.desk_log.failed(now_ms)) |n| log.warn("cannot mute the desk's speakers ({t}){s}; retrying every {d} ms", .{ e, again(&buf, n), self.cfg.retry_ms });
             self.desk = .retrying;
             self.desk_retry_at = now_ms +| self.cfg.retry_ms;
             return;
         };
+        const n = self.desk_log.succeeded();
+        if (n > 0) log.info("the desk's speakers muted after {d} failed attempt(s)", .{n});
         self.desk = .running;
     }
 
@@ -354,11 +402,14 @@ pub const Bridge = struct {
 
     fn connectMic(self: *Bridge, now_ms: u64) void {
         self.backend.startMic(self.cfg.mic) catch |e| {
-            log.warn("cannot create the virtual microphone ({t}); retrying in {d} ms", .{ e, self.cfg.retry_ms });
+            var buf: [64]u8 = undefined;
+            if (self.mic_log.failed(now_ms)) |n| log.warn("cannot create the virtual microphone ({t}){s}; retrying every {d} ms", .{ e, again(&buf, n), self.cfg.retry_ms });
             self.mic = .retrying;
             self.mic_retry_at = now_ms +| self.cfg.retry_ms;
             return;
         };
+        const n = self.mic_log.succeeded();
+        if (n > 0) log.info("virtual microphone created after {d} failed attempt(s)", .{n});
         self.mic = .running;
     }
 
@@ -430,4 +481,35 @@ const mic_pause_ms = 1000;
 
 fn framesOf(rate: u32, ms: u32) usize {
     return @max(1, @as(usize, rate) * ms / 1000);
+}
+
+test "a retried failure is logged first, then once a minute, and its end once" {
+    var r: RetryLog = .{};
+    try std.testing.expectEqual(@as(?u32, 0), r.failed(0));
+    var t: u64 = 2000;
+    while (t < RetryLog.every_ms) : (t += 2000) try std.testing.expectEqual(@as(?u32, null), r.failed(t));
+    try std.testing.expectEqual(@as(?u32, 29), r.failed(t));
+    try std.testing.expectEqual(@as(?u32, null), r.failed(t + 2000));
+    try std.testing.expectEqual(32, r.succeeded());
+    try std.testing.expectEqual(0, r.succeeded());
+    try std.testing.expectEqual(@as(?u32, 0), r.failed(t + 4000)); // a new failure: logged at once
+}
+
+test "a desk mute that keeps failing logs about once a minute, not at every retry" {
+    const fake = @import("fake.zig");
+    var fb = fake.FakeBackend.init(std.testing.allocator);
+    defer fb.deinit();
+    fb.fail_desk = 1000;
+    var b = try Bridge.init(std.testing.allocator, fb.backend(), .{});
+    defer b.deinit();
+    b.muteDesk(0);
+    var t: u64 = 0;
+    while (t < 30 * 60_000) : (t += 100) try b.process(t);
+    try std.testing.expectEqual(StreamState.retrying, b.deskState());
+    try std.testing.expect(b.desk_log.failures >= 899);
+    try std.testing.expectEqual(30, b.desk_log.logged);
+    fb.fail_desk = 0;
+    try b.process(t + 2000);
+    try std.testing.expectEqual(StreamState.running, b.deskState());
+    try std.testing.expectEqual(0, b.desk_log.failures);
 }

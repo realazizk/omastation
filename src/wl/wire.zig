@@ -269,6 +269,8 @@ pub const Connection = struct {
     /// Server-allocated ids, indexed by id - server_id_start.
     server_objects: std.ArrayList(Object) = .empty,
     free_ids: std.ArrayList(u32) = .empty,
+    /// Client ids below this were sent: `objects.items.len` at the last flush (`unsendObject`).
+    known_ids: usize = display_id + 1,
 
     dispatching: bool = false,
     protocol_error: ?ProtocolError = null,
@@ -408,7 +410,13 @@ pub const Connection = struct {
         };
         if (size > max_request_size) return error.MessageTooLarge;
         if (nfds > sys.max_fds_out) return error.InvalidArgument;
-        if (conn.out_len + size > conn.out.len or conn.out_fds_len + nfds > conn.out_fds.len) try conn.flush();
+        if (conn.out_len + size > conn.out.len or conn.out_fds_len + nfds > conn.out_fds.len) {
+            try conn.flush();
+            // The ids this request creates were allocated already but are not known yet.
+            for (args) |a| if (a == .new_id) {
+                conn.known_ids = @min(conn.known_ids, a.new_id);
+            };
+        }
 
         // Duplicate fds first so a failure leaves the queue untouched.
         var dups: [sys.max_fds_out]Fd = undefined;
@@ -484,6 +492,57 @@ pub const Connection = struct {
             sent += n;
         }
         conn.out_len = 0;
+        conn.known_ids = conn.objects.items.len;
+    }
+
+    /// Takes back object `id` before the compositor heard of it: the queued request on
+    /// `creator` with `opcode` that made it (`id` its first argument) and the queued requests
+    /// on `id`, as if never made. Only for requests without fds, on an object no other request
+    /// names. False, with nothing changed, once the creating request was sent, or when a newer
+    /// object made after it in the queue needs `id`'s number (the compositor takes fresh ids
+    /// only in order).
+    pub fn unsendObject(conn: *Connection, creator: u32, opcode: u16, id: u32) bool {
+        if (conn.broken or id <= display_id or id >= server_id_start) return false;
+        const obj = conn.object(id) orelse return false;
+        if (obj.state != .live) return false;
+        const fresh = id >= conn.known_ids;
+        if (fresh and id + 1 != conn.objects.items.len) return false;
+        var pos: usize = 0;
+        const start = while (pos + header_size <= conn.out_len) {
+            const size = conn.queuedSize(pos);
+            if (conn.queuedObject(pos) == creator and conn.queuedOpcode(pos) == opcode and size >= header_size + 4 and
+                std.mem.readInt(u32, conn.out[pos + header_size ..][0..4], .little) == id) break pos;
+            pos += size;
+        } else return false;
+        var r = start;
+        var w = start;
+        while (r < conn.out_len) {
+            const size = conn.queuedSize(r);
+            if (r == start or conn.queuedObject(r) == id) {
+                r += size;
+                continue;
+            }
+            if (w != r) std.mem.copyForwards(u8, conn.out[w..][0..size], conn.out[r..][0..size]);
+            w += size;
+            r += size;
+        }
+        conn.out_len = w;
+        if (fresh) {
+            conn.objects.shrinkRetainingCapacity(id);
+        } else conn.freeId(id);
+        return true;
+    }
+
+    fn queuedObject(conn: *const Connection, pos: usize) u32 {
+        return std.mem.readInt(u32, conn.out[pos..][0..4], .little);
+    }
+
+    fn queuedOpcode(conn: *const Connection, pos: usize) u16 {
+        return @truncate(std.mem.readInt(u32, conn.out[pos + 4 ..][0..4], .little));
+    }
+
+    fn queuedSize(conn: *const Connection, pos: usize) usize {
+        return std.mem.readInt(u32, conn.out[pos + 4 ..][0..4], .little) >> 16;
     }
 
     /// Returns false if nothing was available (non-blocking mode).
@@ -610,32 +669,34 @@ pub const Connection = struct {
         }
     }
 
-    /// Flush, then read and dispatch without blocking.
+    /// Read and dispatch without blocking, then flush. Events first: one already here may make
+    /// a queued request moot before it is sent (a stopped capture session takes back its queued
+    /// frame, `Capture.onSession`).
     pub fn dispatch(conn: *Connection) Error!usize {
-        try conn.flush();
-        var n = try conn.dispatchPending();
-        var reads: usize = 0;
-        while (reads < 64 and try conn.readSome(true)) : (reads += 1) n += try conn.dispatchPending();
+        const n = try conn.dispatchAvailable();
         try conn.flush();
         return n;
     }
 
-    /// Flush, then wait up to `timeout_ms` (-1: forever); returns 0 on timeout.
-    pub fn dispatchTimeout(conn: *Connection, timeout_ms: i32) Error!usize {
-        try conn.flush();
+    fn dispatchAvailable(conn: *Connection) Error!usize {
         var n = try conn.dispatchPending();
-        if (n > 0) {
-            try conn.flush();
-            return n;
-        }
+        var reads: usize = 0;
+        while (reads < 64 and try conn.readSome(true)) : (reads += 1) n += try conn.dispatchPending();
+        return n;
+    }
+
+    /// `dispatch`, or with nothing there, wait up to `timeout_ms` (-1: forever) after the flush;
+    /// returns 0 on timeout.
+    pub fn dispatchTimeout(conn: *Connection, timeout_ms: i32) Error!usize {
+        var n = try conn.dispatchAvailable();
+        try conn.flush();
+        if (n > 0) return n;
         switch (try sys.pollFd(conn.fd, false, timeout_ms)) {
             .timeout => return 0,
             .hangup, .ready => {},
         }
         _ = try conn.readSome(false);
-        n = try conn.dispatchPending();
-        var reads: usize = 0;
-        while (reads < 64 and try conn.readSome(true)) : (reads += 1) n += try conn.dispatchPending();
+        n = try conn.dispatchAvailable();
         try conn.flush();
         return n;
     }
@@ -764,6 +825,67 @@ test "generated request helpers" {
     try testing.expectEqual(5, std.mem.readInt(u32, b[24..28], .little));
     try testing.expectEqual(3, std.mem.readInt(u32, b[28..32], .little));
     try testing.expectEqual(12 + 32 + 12, got.len);
+}
+
+test "unsendObject takes back a queued object and its requests, never one sent or whose number is needed" {
+    const sp = try sys.socketPair();
+    defer sys.close(sp[1]);
+    const conn = try Connection.initFd(testing.allocator, sp[0]);
+    defer conn.deinit();
+    var buf: [512]u8 = undefined;
+
+    // A sent parent; then queued: a child with two requests, another object's requests around them.
+    const parent = try conn.newIdVersioned(.ext_image_copy_capture_session_v1, 1);
+    try conn.request(parent, 7, &.{});
+    try conn.flush();
+    _ = try readAllFrom(sp[1], &buf);
+    const other = try conn.newIdVersioned(.wl_seat, 1);
+    try conn.request(other, 1, &.{.{ .uint = 11 }});
+    const child = try conn.newIdVersioned(.ext_image_copy_capture_frame_v1, 1);
+    try conn.request(parent, 0, &.{.{ .new_id = child }});
+    try conn.request(child, 1, &.{.{ .object = 9 }});
+    try conn.request(other, 2, &.{});
+    try conn.request(child, 3, &.{});
+    try testing.expect(!conn.unsendObject(parent, 1, child)); // no such creating request
+    try testing.expect(!conn.unsendObject(other, 0, child));
+    try testing.expect(conn.unsendObject(parent, 0, child));
+    // Fresh and the newest: its number goes back, the next object gets it.
+    try testing.expectEqual(child, conn.objects.items.len);
+    try conn.flush();
+    var got = try readAllFrom(sp[1], &buf);
+    try testing.expectEqual(2 * header_size + 4, got.len); // other's two requests, nothing of the child's
+    try testing.expectEqual(other, std.mem.readInt(u32, buf[0..4], .little));
+    try testing.expectEqual(other, std.mem.readInt(u32, buf[12..16], .little));
+    try testing.expectEqual(1 << 19 | 2, std.mem.readInt(u32, buf[16..20], .little));
+
+    // A fresh object with a newer one after it keeps its number: not taken back.
+    const a = try conn.newIdVersioned(.ext_image_copy_capture_frame_v1, 1);
+    try conn.request(parent, 0, &.{.{ .new_id = a }});
+    const b = try conn.newIdVersioned(.ext_image_copy_capture_frame_v1, 1);
+    try conn.request(parent, 0, &.{.{ .new_id = b }});
+    try testing.expect(!conn.unsendObject(parent, 0, a));
+    try testing.expect(conn.unsendObject(parent, 0, b));
+    try conn.flush();
+    got = try readAllFrom(sp[1], &buf);
+    try testing.expectEqual(header_size + 4, got.len);
+    try testing.expectEqual(a, std.mem.readInt(u32, buf[8..12], .little));
+    // Sent: too late.
+    try testing.expect(!conn.unsendObject(parent, 0, a));
+
+    // A reused number (freed by the compositor) goes back to the free list, wherever it sits.
+    conn.destroyed(a);
+    conn.freeId(a);
+    const reused = try conn.newIdVersioned(.ext_image_copy_capture_frame_v1, 1);
+    try testing.expectEqual(a, reused);
+    try conn.request(parent, 0, &.{.{ .new_id = reused }});
+    const after = try conn.newIdVersioned(.wl_seat, 1);
+    try conn.request(after, 0, &.{});
+    try testing.expect(conn.unsendObject(parent, 0, reused));
+    try testing.expectEqual(reused, try conn.newIdVersioned(.wl_callback, 1));
+    try conn.flush();
+    got = try readAllFrom(sp[1], &buf);
+    try testing.expectEqual(header_size, got.len);
+    try testing.expectEqual(after, std.mem.readInt(u32, buf[0..4], .little));
 }
 
 fn sendEvent(fd: Fd, id: u32, opcode: u16, args: []const u8, fds: []const Fd) !void {

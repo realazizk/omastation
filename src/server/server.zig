@@ -14,6 +14,7 @@ pub const dvcqueue = @import("dvcqueue.zig");
 pub const gfx_codecs = @import("gfx_codecs.zig");
 pub const video = @import("video.zig");
 pub const scene = @import("scene.zig");
+pub const test_capture = @import("test_capture.zig");
 pub const compression = @import("compression.zig");
 pub const legacy = @import("legacy.zig");
 pub const pointer = @import("pointer.zig");
@@ -24,6 +25,10 @@ pub const sspi_harness = @import("sspi_harness.zig");
 pub const udp = @import("udp.zig");
 pub const multitransport = @import("multitransport.zig");
 pub const flight = @import("flight.zig");
+pub const channels = @import("channels.zig");
+pub const echo = @import("echo.zig");
+pub const flow = @import("flow.zig");
+pub const autodetect = @import("autodetect.zig");
 
 test {
     @import("std").testing.refAllDecls(@This());

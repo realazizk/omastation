@@ -12,7 +12,7 @@ jobs:
     container: archlinux:base-devel
     steps:
       - name: Install zig and the libraries the server links
-        run: pacman -Syu --noconfirm --needed git zig pkgconf openssl pam libva libxkbcommon opus libfdk-aac gsm fuse3 libpipewire
+        run: pacman -Syu --noconfirm --needed git zig pkgconf openssl pam libva mesa vulkan-headers vulkan-icd-loader libxkbcommon opus libfdk-aac gsm fuse3 libpipewire openh264
 
       - uses: actions/checkout@v4
 

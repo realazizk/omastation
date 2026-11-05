@@ -1,0 +1,43 @@
+From: realazizk <azizk@tuta.com>
+Date: Wed, 28 Oct 2026 13:42:37 +0100
+Subject: [PATCH 2/4] screenshare: a new frame of a stopped output session has
+ no monitor transform
+
+A client can send ext_image_copy_capture_session_v1.create_frame before it
+reads the session's `stopped`: the protocol answers such a frame with
+failed(stopped). When the session stopped because its output was removed,
+CImageCopyCaptureFrame's constructor sends CScreenshareFrame::transform(),
+which read the null monitor's transform and crashed (SIGSEGV,
+ScreenshareFrame.cpp:513). It now reports the normal transform for a gone
+monitor; capturing the frame fails with `stopped` (share() checks it).
+
+Upstream main no longer reads the monitor here since #15714 ("render: always
+render in normal transform"); that change depends on the render rewrite, so
+0.56.2 gets only the null check.
+---
+ src/managers/screenshare/ScreenshareFrame.cpp | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/managers/screenshare/ScreenshareFrame.cpp b/src/managers/screenshare/ScreenshareFrame.cpp
+index c74adcb..fcef499 100644
+--- a/src/managers/screenshare/ScreenshareFrame.cpp
++++ b/src/managers/screenshare/ScreenshareFrame.cpp
+@@ -508,9 +508,17 @@ Vector2D CScreenshareFrame::bufferSize() const {
+ }
+ 
+ wl_output_transform CScreenshareFrame::transform() const {
++    if (m_session.expired())
++        return WL_OUTPUT_TRANSFORM_NORMAL;
++
+     switch (m_session->m_type) {
+         case SHARE_REGION:
+-        case SHARE_MONITOR: return m_session->monitor()->m_transform;
++        case SHARE_MONITOR: {
++            // a frame created after the monitor went (the session is stopped; capturing it fails
++            // with `stopped`) has no transform to report
++            const auto PMONITOR = m_session->monitor();
++            return PMONITOR ? PMONITOR->m_transform : WL_OUTPUT_TRANSFORM_NORMAL;
++        }
+         default:
+         case SHARE_WINDOW: return WL_OUTPUT_TRANSFORM_NORMAL;
+     }

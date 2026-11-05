@@ -46,16 +46,34 @@ if [ -f "$binds" ]; then
 	rm -f "$binds"
 fi
 
-# Unmute exactly the sinks omastation muted.
+# Unmute exactly the sinks omastation muted. A sound card's sink is muted on its card's Route:
+# its node can read unmuted while the Route is still muted, and then "set-mute 0" does nothing,
+# so each sink is muted and unmuted again. The record stays until every sink reads unmuted,
+# for the next stop to try again.
 muted=$state/desk-muted
 if [ -f "$muted" ]; then
 	echo "omastation stopped during a remote session: unmuting the desk's speakers" >&2
+	left=0
 	while IFS= read -r sink; do
 		[ -n "$sink" ] || continue
 		node=$(pw-dump 2>/dev/null | jq -r --arg n "$sink" '.[] | select(.info.props["node.name"] == $n) | .id' | head -1)
-		[ -n "$node" ] && wpctl set-mute "$node" 0 >/dev/null 2>&1
+		[ -n "$node" ] || continue
+		i=0
+		while [ $i -lt 5 ]; do
+			wpctl set-mute "$node" 1 >/dev/null 2>&1
+			wpctl set-mute "$node" 0 >/dev/null 2>&1
+			sleep 0.2
+			case $(wpctl get-volume "$node" 2>/dev/null) in
+			*MUTED*) i=$((i + 1)) ;;
+			*) break ;;
+			esac
+		done
+		if [ $i -ge 5 ]; then
+			echo "the desk's speakers ($sink) still read muted" >&2
+			left=1
+		fi
 	done <"$muted"
-	rm -f "$muted"
+	[ $left -eq 0 ] && rm -f "$muted"
 fi
 
 # Put the previous default source back if it still names omastation's microphone.

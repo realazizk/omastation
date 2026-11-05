@@ -8,6 +8,7 @@ pub const proto = wire.proto;
 pub const scanner = @import("scanner.zig");
 pub const client = @import("client.zig");
 pub const shm = @import("shm.zig");
+pub const dmabuf = @import("dmabuf.zig");
 pub const capture = @import("capture.zig");
 pub const cursor = @import("cursor.zig");
 pub const input = @import("input.zig");
@@ -30,6 +31,7 @@ test {
     _ = scanner;
     _ = client;
     _ = shm;
+    _ = dmabuf;
     _ = capture;
     _ = cursor;
     _ = input;

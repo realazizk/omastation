@@ -5,6 +5,8 @@ pub const planar = @import("planar.zig");
 pub const h264_bitstream = @import("h264_bitstream.zig");
 pub const h264_va = @import("h264_va.zig");
 pub const vaapi_h264 = @import("vaapi_h264.zig");
+pub const openh264 = @import("openh264.zig");
+pub const h264 = @import("h264.zig");
 pub const avc420 = @import("avc420.zig");
 
 test {

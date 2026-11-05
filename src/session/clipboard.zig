@@ -705,7 +705,11 @@ pub const Bridge = struct {
 
     /// 3.1.5.4.6: lindex into the current selection's File List, or the one locked under clipDataId.
     fn onFileContentsRequest(b: *Bridge, req: cliprdr.FileContentsRequest) Error!void {
-        const set: ?*LocalSet = if (req.clip_data_id) |id| b.lockedSet(id) else b.current_set;
+        const lock = b.srv.fileContentsLock(req);
+        if (req.clip_data_id) |id| if (lock == null) {
+            log.debug("client: clipDataId {d} ignored (locking not negotiated); stream {d} gets the current File List", .{ id, req.stream_id });
+        };
+        const set: ?*LocalSet = if (lock) |id| b.lockedSet(id) else b.current_set;
         const files: ?*const cliprdr.LocalFiles = if (set) |s| (if (s.files) |*f| f else null) else null;
         const range = req.flags & cliprdr.FILECONTENTS_RANGE != 0;
         if (!b.active or files == null or (range and req.cb_requested > b.opts.max_data_len)) {
@@ -1786,4 +1790,99 @@ test "Messages splits back-to-back PDUs" {
 
 test {
     std.testing.refAllDecls(Bridge);
+}
+
+/// Hands the client PDU `encode` writes with `args` to the bridge; `outgoing` keeps only what it answers.
+fn testClientPdu(b: *Bridge, comptime encode: anytype, args: anytype) !void {
+    var pdu: std.ArrayList(u8) = .empty;
+    defer pdu.deinit(b.gpa);
+    var w = bytes.Writer.init(&pdu, b.gpa);
+    try @call(.auto, encode, .{&w} ++ args);
+    b.clearOutgoing();
+    try b.handleMessage(pdu.items);
+}
+
+/// The data of the only PDU in `outgoing`, a successful File Contents Response for `stream_id`.
+fn testFileContents(b: *const Bridge, stream_id: u32) ![]const u8 {
+    var m: Messages = .{ .rest = b.outgoing() };
+    const r = try cliprdr.decodeFileContentsResponse(m.next() orelse return error.NoResponse);
+    try std.testing.expect(m.next() == null);
+    try std.testing.expectEqual(stream_id, r.stream_id);
+    if (!r.ok) return error.ResponseFailed;
+    return r.data;
+}
+
+test "FreeRDP copies desktop files with Lock and clipDataId but no CB_CAN_LOCK_CLIPDATA" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "hello, client" });
+    const path = try tmp.dir.realPathFileAlloc(io, "a.txt", gpa);
+    defer gpa.free(path);
+
+    const b = try Bridge.create(gpa, null, .{ .io = io, .active = true });
+    defer b.destroy();
+    try b.start();
+    // FreeRDP 3.32's Clipboard Capabilities and its first (empty) Format List.
+    try testClientPdu(b, cliprdr.encodeCaps, .{cliprdr.GeneralCapability{ .flags = cliprdr.CB_USE_LONG_FORMAT_NAMES |
+        cliprdr.CB_STREAM_FILECLIP_ENABLED | cliprdr.CB_FILECLIP_NO_FILE_PATHS | cliprdr.CB_HUGE_FILE_SUPPORT_ENABLED }});
+    try testClientPdu(b, cliprdr.encodeFormatList, .{ &[_]cliprdr.Format{}, cliprdr.NameEncoding.long });
+    // The desktop selection is a file: the Format List announceLocal sends for it.
+    const formats = try cliprdr.formatsForMimeTypes(gpa, &.{cliprdr.mime_uri_list}, b.srv.negotiatedFlags());
+    defer gpa.free(formats);
+    try std.testing.expectEqualStrings(cliprdr.name_file_group_descriptor_w, formats[0].name);
+    try b.srv.setLocalFormats(formats, &b.out);
+    try testClientPdu(b, cliprdr.encodeFormatListResponse, .{true});
+    try testClientPdu(b, cliprdr.encodeLockClipdata, .{2});
+    try std.testing.expectEqual(@as(usize, 0), b.outgoing().len);
+    try std.testing.expectEqual(@as(usize, 0), b.locks.items.len);
+    // The File List the client's Format Data Request gets (finishLocalRead).
+    const uri_list = try cliprdr.formatUriList(gpa, &.{path});
+    defer gpa.free(uri_list);
+    const list = try b.describeFiles(cliprdr.mime_uri_list, uri_list, b.local_gen);
+    defer gpa.free(list);
+
+    try testClientPdu(b, cliprdr.encodeFileContentsRequest, .{cliprdr.FileContentsRequest{ .stream_id = 1, .lindex = 0, .flags = cliprdr.FILECONTENTS_SIZE, .cb_requested = 8, .clip_data_id = 2 }});
+    try std.testing.expectEqual(@as(u64, 13), std.mem.readInt(u64, (try testFileContents(b, 1))[0..8], .little));
+    try testClientPdu(b, cliprdr.encodeFileContentsRequest, .{cliprdr.FileContentsRequest{ .stream_id = 2, .lindex = 0, .flags = cliprdr.FILECONTENTS_RANGE, .cb_requested = 1 << 16, .clip_data_id = 2 }});
+    try std.testing.expectEqualStrings("hello, client", try testFileContents(b, 2));
+    try testClientPdu(b, cliprdr.encodeUnlockClipdata, .{2});
+    try std.testing.expectEqual(@as(usize, 0), b.outgoing().len);
+}
+
+test "with CB_CAN_LOCK_CLIPDATA a lock keeps the files of a selection gone since" {
+    const gpa = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "a.txt", .data = "locked" });
+    const path = try tmp.dir.realPathFileAlloc(io, "a.txt", gpa);
+    defer gpa.free(path);
+
+    const b = try Bridge.create(gpa, null, .{ .io = io, .active = true });
+    defer b.destroy();
+    try b.start();
+    try testClientPdu(b, cliprdr.encodeCaps, .{cliprdr.GeneralCapability{ .flags = cliprdr.all_general_flags }});
+    try testClientPdu(b, cliprdr.encodeFormatList, .{ &[_]cliprdr.Format{}, cliprdr.NameEncoding.long });
+    const formats = try cliprdr.formatsForMimeTypes(gpa, &.{cliprdr.mime_uri_list}, b.srv.negotiatedFlags());
+    defer gpa.free(formats);
+    try b.srv.setLocalFormats(formats, &b.out);
+    try testClientPdu(b, cliprdr.encodeFormatListResponse, .{true});
+    const uri_list = try cliprdr.formatUriList(gpa, &.{path});
+    defer gpa.free(uri_list);
+    const list = try b.describeFiles(cliprdr.mime_uri_list, uri_list, b.local_gen);
+    defer gpa.free(list);
+    try testClientPdu(b, cliprdr.encodeLockClipdata, .{5});
+    try std.testing.expectEqual(@as(usize, 1), b.locks.items.len);
+    // The desktop selection changes: only the lock still has the files.
+    b.newLocalGen();
+    try testClientPdu(b, cliprdr.encodeFileContentsRequest, .{cliprdr.FileContentsRequest{ .stream_id = 1, .lindex = 0, .flags = cliprdr.FILECONTENTS_RANGE, .cb_requested = 64, .clip_data_id = 5 }});
+    try std.testing.expectEqualStrings("locked", try testFileContents(b, 1));
+    try testClientPdu(b, cliprdr.encodeFileContentsRequest, .{cliprdr.FileContentsRequest{ .stream_id = 2, .lindex = 0, .flags = cliprdr.FILECONTENTS_RANGE, .cb_requested = 64 }});
+    try std.testing.expectError(error.ResponseFailed, testFileContents(b, 2));
+    try testClientPdu(b, cliprdr.encodeFileContentsRequest, .{cliprdr.FileContentsRequest{ .stream_id = 3, .lindex = 0, .flags = cliprdr.FILECONTENTS_RANGE, .cb_requested = 64, .clip_data_id = 6 }});
+    try std.testing.expectError(error.ResponseFailed, testFileContents(b, 3));
+    try testClientPdu(b, cliprdr.encodeUnlockClipdata, .{5});
+    try std.testing.expectEqual(@as(usize, 0), b.locks.items.len);
 }

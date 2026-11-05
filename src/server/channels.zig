@@ -2,6 +2,8 @@
 //! with bitmap updates when RDPGFX is unavailable.
 
 const std = @import("std");
+const rdp = @import("../proto/rdp.zig");
+const caps = @import("../proto/caps.zig");
 const bytes = @import("../core/bytes.zig");
 const gfx = @import("../proto/gfx.zig");
 const disp = @import("../proto/disp.zig");
@@ -9,6 +11,7 @@ const fastpath = @import("../proto/fastpath.zig");
 const zgfx = @import("../codec/zgfx.zig");
 const clear_codec = @import("../codec/clear.zig");
 const wl = @import("../wl/wl.zig");
+const gpucap = @import("../gpu/capture.zig");
 const framebuffer = @import("framebuffer.zig");
 const adapt_mod = @import("adapt.zig");
 const codec_policy = @import("codec_policy.zig");
@@ -47,6 +50,9 @@ pub const Stats = struct {
     blocked: u64 = 0,
     avc_frames: u64 = 0,
     avc444_frames: u64 = 0,
+    /// AVC444 frames sent as luma alone (LC 1), and chroma paid later (LC 2 bitmaps).
+    avc444_luma: u64 = 0,
+    chroma_pays: u64 = 0,
     prog_frames: u64 = 0,
     rfx_frames: u64 = 0,
     refines: u64 = 0,
@@ -376,6 +382,7 @@ fn onGfx(c: *Conn, msg: []const u8) conn_mod.Error!void {
 }
 
 pub fn resetGraphics(c: *Conn) conn_mod.Error!void {
+    log.debug("{s}: graphics reset for {d}x{d}", .{ c.peer, c.enc.width, c.enc.height });
     if (surfaces.isMulti(c)) return surfaces.resetGraphics(c);
     var list: std.ArrayList(u8) = .empty;
     defer list.deinit(c.gpa);
@@ -448,10 +455,23 @@ pub fn canSendFrame(c: *Conn) bool {
     return c.graphicsAdmit(if (c.ch.acks_suspended) null else c.ch.frames_unacked);
 }
 
-pub fn sendDesktopFrame(c: *Conn, f: *const wl.Frame) conn_mod.Error!void {
+/// `gpu`: how frames captured into dmabufs (GPU capture) reach the encoder; without it they are
+/// skipped.
+pub fn sendDesktopFrame(c: *Conn, f: *const wl.Frame, gpu: ?gpucap.Handle) conn_mod.Error!void {
     // Reject malformed compositor frames before reading any pixel.
     if (f.width == 0 or f.height == 0 or f.width > disp.max_desktop or f.height > disp.max_desktop) return error.InvalidDimensions;
     if (@as(u64, f.stride) < @as(u64, f.width) * 4) return error.InvalidDimensions;
+    if (f.dmabuf != null) {
+        const g = gpu orelse return error.InvalidDimensions;
+        // The GPU path takes upright BGRX only; anything else switches the capture to shm, whose
+        // frames come upright: size the surface for that (90/270 swap width and height).
+        const swap = swapsAxes(f.transform) orelse false;
+        const w = if (swap) f.height else f.width;
+        const h = if (swap) f.width else f.height;
+        if (w != c.enc.width or h != c.enc.height) try resizeSurface(c, w, h);
+        if (c.reactivating) return;
+        return sendFrameFrom(c, .{ .gpu = .{ .handle = g, .frame = f } });
+    }
     if (f.data.len < @as(u64, f.stride) * (f.height - 1) + @as(u64, f.width) * 4) return error.InvalidDimensions;
     const lay = pixelLayout(f.format) orelse {
         log.warn("{s}: capture format {t} not supported", .{ c.peer, f.format });
@@ -551,27 +571,93 @@ fn resizeSurface(c: *Conn, w: u32, h: u32) conn_mod.Error!void {
             if (!monitorsCover(c, w, h)) setSingleMonitor(c);
         }
     } else if (w != c.width or h != c.height) {
-        if (c.ch.reactivate_on_resize) {
-            c.ch.reactivate_on_resize = false;
-            c.width = @intCast(w);
-            c.height = @intCast(h);
-            if (!monitorsCover(c, w, h)) setSingleMonitor(c);
-            try c.enc.reset(w, h);
-            return c.reactivate();
+        // Without RDPGFX the client keeps the Demand Active size (MS-RDPBCGR 2.2.7.1.2) until a
+        // reactivation, whoever changed the desktop: a Display Control layout, or the compositor
+        // (a mode set, a rotation).
+        const asked = c.ch.reactivate_on_resize;
+        c.ch.reactivate_on_resize = false;
+        switch (legacyResize(c.ch.gfx_refused, c.reactivating, asked or c.client_caps.desktop_resize)) {
+            .graphics, .later => {},
+            .reactivate => {
+                c.width = @intCast(w);
+                c.height = @intCast(h);
+                if (!monitorsCover(c, w, h)) setSingleMonitor(c);
+                try c.enc.reset(w, h);
+                return c.reactivate();
+            },
+            .keep => log.warn("{s}: desktop is {d}x{d} but the client has {d}x{d} and cannot resize it (desktopResizeFlag)", .{ c.peer, w, h, c.width, c.height }),
         }
-        // Without RDPGFX the client keeps the Demand Active size (MS-RDPBCGR 2.2.7.1.2) until reactivation.
-        log.warn("{s}: desktop is {d}x{d} but the client has {d}x{d}", .{ c.peer, w, h, c.width, c.height });
     }
     try c.enc.reset(w, h);
     if (c.ch.gfx_ready and (c.ch.surface_w != w or c.ch.surface_h != h)) try resetGraphics(c);
 }
 
+/// What a desktop of a new size means for a client without RDPGFX up.
+const LegacyResize = enum {
+    /// RDPGFX is coming up: its RESET_GRAPHICS carries the size.
+    graphics,
+    /// A reactivation is under way: another follows once the client confirms it (`reactivated`).
+    later,
+    reactivate,
+    /// The client cannot resize its desktop: it sees the top left.
+    keep,
+};
+
+fn legacyResize(gfx_refused: bool, reactivating: bool, can_resize: bool) LegacyResize {
+    if (!gfx_refused) return .graphics;
+    if (reactivating) return .later;
+    return if (can_resize) .reactivate else .keep;
+}
+
+/// The client finished a reactivation (MS-RDPBCGR 1.3.1.3): another one when the desktop changed
+/// size meanwhile (frames are held while reactivating), else the whole picture again.
+pub fn reactivated(c: *Conn) conn_mod.Error!void {
+    const w = c.enc.width;
+    const h = c.enc.height;
+    if (!c.ch.gfx_ready and w != 0 and (w != c.width or h != c.height) and c.client_caps.desktop_resize) {
+        c.width = @intCast(w);
+        c.height = @intCast(h);
+        if (!monitorsCover(c, w, h)) setSingleMonitor(c);
+        return c.reactivate();
+    }
+    return refresh(c);
+}
+
+/// Where a frame's changes come from: its pixels (diffed on the CPU) or the GPU path.
+const Source = union(enum) {
+    cpu: struct { pixels: []const u8, stride: usize },
+    gpu: struct { handle: gpucap.Handle, frame: *const wl.Frame },
+};
+
+/// Encoder.diff's result for the frame, or null when the GPU path could not take it (skip it).
+fn diffFrom(c: *Conn, src: Source) conn_mod.Error!?usize {
+    switch (src) {
+        .cpu => |p| {
+            // A shadow lagging the screen (GPU capture left tiles on the GPU) is no reference.
+            try c.enc.freshenAll();
+            const n = try c.enc.diff(p.pixels, p.stride);
+            c.enc.gpu_token = 0;
+            return n;
+        },
+        .gpu => |g| return try g.handle.out.diff(g.handle.cap, &c.enc, g.frame, gfx_codecs.readbackHint(c, g.handle.out)),
+    }
+}
+
 fn sendFrame(c: *Conn, pixels: []const u8, stride: usize) conn_mod.Error!void {
+    return sendFrameFrom(c, .{ .cpu = .{ .pixels = pixels, .stride = stride } });
+}
+
+fn sendFrameFrom(c: *Conn, src: Source) conn_mod.Error!void {
     // No updates while output is suppressed (MS-RDPBCGR 3.3.5.11.2).
     if (c.output_suppressed) return c.flush();
+    c.ch.surf.gpu = switch (src) {
+        .gpu => |g| g.handle,
+        .cpu => null,
+    };
+    defer c.ch.surf.gpu = null;
     if (!c.ch.gfx_ready) {
         // While reactivating, only the shadow is updated.
-        const changed = try c.enc.diff(pixels, stride);
+        const changed = try diffFrom(c, src) orelse return;
         if (c.reactivating or (changed == 0 and !c.enc.hasOwed())) return;
         try c.enc.mergeOwed();
         c.pacing.frameStarted(conn_mod.nowMs());
@@ -580,7 +666,8 @@ fn sendFrame(c: *Conn, pixels: []const u8, stride: usize) conn_mod.Error!void {
     }
     const sid = c.ch.surface_id orelse return;
     const t0 = nowNs();
-    if (try c.enc.diff(pixels, stride) == 0 and !c.enc.hasOwed()) return;
+    const changed = try diffFrom(c, src) orelse return;
+    if (changed == 0 and !c.enc.hasOwed()) return;
     c.enc.touch(conn_mod.nowMs());
     // Changed tiles count toward video regions (video.zig); owed tiles do not.
     try gfx_codecs.trackVideo(c);
@@ -615,7 +702,7 @@ fn sendFrame(c: *Conn, pixels: []const u8, stride: usize) conn_mod.Error!void {
     c.ch.last_frame_ms = conn_mod.nowMs();
     c.ch.frame_id = fid;
     const t2 = nowNs();
-    if (sent == .avc420 or sent == .avc444) c.pacing.encoded(@as(f64, @floatFromInt(t2 - t1)) / 1e6);
+    if (sent == .avc420 or sent == .avc444) c.pacing.encoded(@as(f64, @floatFromInt(t2 - t1)) / 1e6) else c.pacing.h264_last = false;
     const wire = try sendGfx(c, list.items);
     const t3 = nowNs();
     c.ch.frames_unacked +|= 1;
@@ -783,11 +870,13 @@ fn logStats(c: *Conn) void {
         std.fmt.bufPrint(&region_buf, "{d}x{d} at {d},{d}", .{ r.right - r.left, r.bottom - r.top, r.left, r.top }) catch "?"
     else
         "none";
-    log.info("{s}: graphics: {d:.1} fps ({d} avc420, {d} avc444, {d} progressive, {d} remotefx, {d} refines, {d} upgrades; {d} planar, {d} clear rects; video region {s}, {d} frames of it, H.264 {d:.1} Mbit/s), {d:.0}% changed/frame, {d:.1} Mbit/s (zgfx {d:.1}x), per frame: diff {d:.2} ms, encode {d:.2} ms, zgfx {d:.2} ms, send {d:.2} ms; ack {d:.1} ms, {d} waits for acks", .{
+    log.info("{s}: graphics: {d:.1} fps ({d} avc420, {d} avc444 ({d} luma only, {d} chroma paid), {d} progressive, {d} remotefx, {d} refines, {d} upgrades; {d} planar, {d} clear rects; video region {s}, {d} frames of it, H.264 {d:.1} Mbit/s), {d:.0}% changed/frame, {d:.1} Mbit/s (zgfx {d:.1}x), per frame: diff {d:.2} ms, encode {d:.2} ms, zgfx {d:.2} ms, send {d:.2} ms; ack {d:.1} ms, {d} waits for acks", .{
         c.peer,
         f * 1000.0 / @as(f64, @floatFromInt(el)),
         st.avc_frames,
         st.avc444_frames,
+        st.avc444_luma,
+        st.chroma_pays,
         st.prog_frames,
         st.rfx_frames,
         st.refines,
@@ -837,7 +926,8 @@ pub fn resync(c: *Conn) conn_mod.Error!void {
 
 pub fn refresh(c: *Conn) conn_mod.Error!void {
     if (surfaces.isMulti(c)) return surfaces.refresh(c);
-    if (c.desktop == null) {
+    // The test pattern; a test capture's frames are refreshed from the shadow, as a desktop's.
+    if (c.desktop == null and (c.test_source == null or c.enc.width == 0)) {
         c.enc.invalidate();
         return c.sendFullFrame();
     }
@@ -959,4 +1049,105 @@ fn resized(c: *Conn, w: u32, h: u32, rearranged: bool) conn_mod.Error!void {
     try resetGraphics(c);
     c.enc.invalidate();
     if (c.desktop != null) try refresh(c) else try c.flush();
+}
+
+/// The share control PDUs a test connection sent: their types, and a Demand Active's desktop size.
+const SentPdu = struct { kind: rdp.PduType, width: u16 = 0, height: u16 = 0 };
+
+fn readSentPdus(fd: c_int, out: []SentPdu) ![]SentPdu {
+    var buf: [1 << 16]u8 = undefined;
+    var len: usize = 0;
+    while (true) {
+        var pfd = [1]std.c.pollfd{.{ .fd = fd, .events = std.c.POLL.IN, .revents = 0 }};
+        if (std.c.poll(&pfd, 1, 0) <= 0) break;
+        const n = std.c.read(fd, buf[len..].ptr, buf.len - len);
+        if (n <= 0) break;
+        len += @intCast(n);
+    }
+    var count: usize = 0;
+    var off: usize = 0;
+    while (off + 4 <= len) {
+        const frame = buf[off..][0..std.mem.readInt(u16, buf[off + 2 ..][0..2], .big)];
+        off += frame.len;
+        // TPKT, X.224 data, MCS Send Data Indication (initiator, channel, flags, PER length).
+        var p = frame[4 + 3 + 6 ..];
+        p = p[if (p[0] & 0x80 != 0) 2 else 1..];
+        const kind: rdp.PduType = @fromBackingInt(@intCast(@as(u4, @truncate(std.mem.readInt(u16, p[2..4], .little)))));
+        var pdu: SentPdu = .{ .kind = kind };
+        if (kind == .demand_active) {
+            const len_src = std.mem.readInt(u16, p[10..12], .little);
+            const caps_at = 14 + len_src;
+            const n = std.mem.readInt(u16, p[caps_at..][0..2], .little);
+            const cc = try caps.parseClientCaps(p[caps_at + 4 ..], n);
+            pdu.width = cc.desktop_width;
+            pdu.height = cc.desktop_height;
+        }
+        out[count] = pdu;
+        count += 1;
+    }
+    return out[0..count];
+}
+
+test "without RDPGFX, a desktop the compositor resized reactivates the client at the new size" {
+    // A mode set or a rotation by the compositor (no Display Control request) left a client
+    // without RDPGFX at its Demand Active size, its picture cropped.
+    const gpa = std.testing.allocator;
+    const transport = @import("../net/transport.zig");
+    const tls = @import("../net/tls.zig");
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(0, std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.STREAM, 0, &fds));
+    defer _ = std.c.close(fds[1]);
+    var tls_ctx: tls.Context = undefined;
+    var auth_cfg: conn_mod.AuthConfig = undefined;
+    var c = Conn.init(gpa, transport.Transport.init(fds[0]), &tls_ctx, &auth_cfg, null, "test");
+    defer c.deinit();
+    c.width = 1920;
+    c.height = 1080;
+    c.bpp = 32;
+    c.established = true;
+    c.ch.gfx_refused = true;
+    c.client_caps.desktop_resize = true;
+    try c.enc.reset(1920, 1080);
+
+    const px = try gpa.alloc(u8, 2560 * 1440 * 4);
+    defer gpa.free(px);
+    @memset(px, 0x40);
+    var damage = [1]wl.Rect{.{ .x = 0, .y = 0, .width = 2560, .height = 1440 }};
+    var f: wl.Frame = .{ .data = px, .width = 2560, .height = 1440, .stride = 2560 * 4, .format = .xrgb8888, .transform = .normal, .y_invert = false, .damage = &damage, .presented_ns = 0, .latency_ns = 0, .seq = 0 };
+    var pdus: [8]SentPdu = undefined;
+
+    // Larger: Deactivate All, then a Demand Active of the new size.
+    try sendDesktopFrame(&c, &f, null);
+    try std.testing.expect(c.reactivating);
+    try std.testing.expectEqual(2560, c.width);
+    var sent = try readSentPdus(fds[1], &pdus);
+    try std.testing.expectEqual(2, sent.len);
+    try std.testing.expectEqual(rdp.PduType.deactivate_all, sent[0].kind);
+    try std.testing.expectEqual(SentPdu{ .kind = .demand_active, .width = 2560, .height = 1440 }, sent[1]);
+
+    // Rotated while the client has not confirmed yet: nothing sent until it has, then a second
+    // reactivation for the upright size.
+    f.transform = .@"90";
+    try sendDesktopFrame(&c, &f, null);
+    try std.testing.expectEqual(2560, c.width);
+    try std.testing.expectEqual(0, (try readSentPdus(fds[1], &pdus)).len);
+    c.reactivating = false; // the client's Font List
+    try reactivated(&c);
+    try std.testing.expect(c.reactivating);
+    sent = try readSentPdus(fds[1], &pdus);
+    try std.testing.expectEqual(2, sent.len);
+    try std.testing.expectEqual(SentPdu{ .kind = .demand_active, .width = 1440, .height = 2560 }, sent[1]);
+    c.reactivating = false;
+
+    // A client that cannot resize its desktop keeps it (and sees the top left).
+    c.client_caps.desktop_resize = false;
+    c.output_suppressed = true; // no bitmap updates: this connection has no codec state
+    f.width = 1280;
+    f.height = 720;
+    f.stride = 1280 * 4;
+    f.transform = .normal;
+    try sendDesktopFrame(&c, &f, null);
+    try std.testing.expect(!c.reactivating);
+    try std.testing.expectEqual(1440, c.width);
+    for (try readSentPdus(fds[1], &pdus)) |p| try std.testing.expect(p.kind != .deactivate_all and p.kind != .demand_active);
 }

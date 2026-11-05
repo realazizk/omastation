@@ -321,6 +321,58 @@ pub fn toNv12Rows(version: Version, pixels: []const u8, stride: usize, width: u3
     }
 }
 
+/// Planar 4:2:0 (the software H.264 encoder's input): Y, then U and V at half size.
+pub const I420 = struct {
+    y: []u8,
+    y_pitch: usize,
+    u: []u8,
+    v: []u8,
+    uv_pitch: usize,
+};
+
+/// The I420 picture `toI420Rows` writes: width to 16, height to 2.
+pub fn i420Size(width: u32, height: u32) Error!ViewSize {
+    if (width == 0 or height == 0 or width > 0xFFFF or height > 0xFFFF) return error.InvalidDimensions;
+    return .{ .width = std.mem.alignForward(u32, width, 16), .height = std.mem.alignForward(u32, height, 2) };
+}
+
+/// The AVC420 picture of a BGRX frame: full-range BT.709, chroma as the rounded 2x2 averages
+/// of the AVC444 main view (B2/B3), edges replicated to `i420Size`. Source row pairs
+/// `first..end` only; disjoint ranges may run in parallel, each with its own `scratch`
+/// (nv12ScratchLen(width) bytes).
+pub fn toI420Rows(pixels: []const u8, stride: usize, width: u32, height: u32, out: I420, scratch: []u8, first: usize, end: usize) Error!void {
+    const ps = try i420Size(width, height);
+    if (first > end or end > ps.height / 2) return error.InvalidDimensions;
+    if (stride < @as(usize, width) * 4 or pixels.len < (height - 1) * stride + @as(usize, width) * 4)
+        return error.InvalidDimensions;
+    const pw: usize = ps.width;
+    const ph: usize = ps.height;
+    if (scratch.len < 6 * pw) return error.BufferTooSmall;
+    if (out.y_pitch < pw or out.uv_pitch < pw / 2) return error.BufferTooSmall;
+    const cn = (ph / 2 - 1) * out.uv_pitch + pw / 2;
+    if (out.y.len < (ph - 1) * out.y_pitch + pw or out.u.len < cn or out.v.len < cn) return error.BufferTooSmall;
+    const ya = scratch[0..pw];
+    const ua = scratch[pw..][0..pw];
+    const va = scratch[2 * pw ..][0..pw];
+    const yb = scratch[3 * pw ..][0..pw];
+    const ub = scratch[4 * pw ..][0..pw];
+    const vb = scratch[5 * pw ..][0..pw];
+    const w: usize = width;
+    for (first..end) |m| {
+        const r0 = @min(2 * m, height - 1);
+        const r1 = @min(2 * m + 1, height - 1);
+        convertRow(pixels[r0 * stride ..][0 .. w * 4], ya, ua, va);
+        if (r1 == r0) {
+            @memcpy(yb, ya);
+            @memcpy(ub, ua);
+            @memcpy(vb, va);
+        } else convertRow(pixels[r1 * stride ..][0 .. w * 4], yb, ub, vb);
+        @memcpy(out.y[2 * m * out.y_pitch ..][0..pw], ya);
+        @memcpy(out.y[(2 * m + 1) * out.y_pitch ..][0..pw], yb);
+        avgPlanes(out.u[m * out.uv_pitch ..][0 .. pw / 2], out.v[m * out.uv_pitch ..][0 .. pw / 2], ua, ub, va, vb);
+    }
+}
+
 const lanes = 16;
 const V32 = @Vector(lanes, i32);
 
@@ -400,6 +452,31 @@ fn avgInterleave(o: []u8, ua: []const u8, ub: []const u8, va: []const u8, vb: []
     }
 }
 
+/// `avgInterleave` into separate U and V rows.
+fn avgPlanes(uo: []u8, vo: []u8, ua: []const u8, ub: []const u8, va: []const u8, vb: []const u8) void {
+    const W = @Vector(blk / 2, u16);
+    const two: W = @splat(2);
+    var i: usize = 0;
+    while (i + blk <= 2 * uo.len) : (i += blk) {
+        const a = load(ua, i);
+        const b = load(ub, i);
+        const c = load(va, i);
+        const d = load(vb, i);
+        const su = @as(W, pick(a, 0)) + pick(a, 1) + pick(b, 0) + pick(b, 1);
+        const sv = @as(W, pick(c, 0)) + pick(c, 1) + pick(d, 0) + pick(d, 1);
+        const ru: H = @intCast((su + two) >> @splat(2));
+        const rv: H = @intCast((sv + two) >> @splat(2));
+        uo[i / 2 ..][0 .. blk / 2].* = ru;
+        vo[i / 2 ..][0 .. blk / 2].* = rv;
+    }
+    while (i < 2 * uo.len) : (i += 2) {
+        const su: u16 = @as(u16, ua[i]) + ua[i + 1] + ub[i] + ub[i + 1];
+        const sv: u16 = @as(u16, va[i]) + va[i + 1] + vb[i] + vb[i + 1];
+        uo[i / 2] = @intCast((su + 2) / 4);
+        vo[i / 2] = @intCast((sv + 2) / 4);
+    }
+}
+
 fn oddInterleave(o: []u8, u: []const u8, v: []const u8) void {
     var i: usize = 0;
     while (i + blk <= o.len) : (i += blk) o[i..][0..blk].* = zip(pick(load(u, i), 1), pick(load(v, i), 1));
@@ -444,7 +521,7 @@ pub const ChromaDebt = struct {
     gpa: std.mem.Allocator,
     rects: std.ArrayList(avc420.Rect16) = .empty,
 
-    const max_rects = 64;
+    pub const max_rects = 64;
 
     pub fn init(gpa: std.mem.Allocator) Error!ChromaDebt {
         return .{ .gpa = gpa };
@@ -603,6 +680,48 @@ test "toNv12Rows in bands equals one toNv12" {
         try std.testing.expectEqualSlices(u8, buf[0 .. 2 * pic], buf[2 * pic ..]);
         try std.testing.expectError(error.InvalidDimensions, toNv12Rows(ver, px, w * 4, w, h, v[2], v[3], scratch, 30, 41));
         try std.testing.expectError(error.InvalidDimensions, toNv12Rows(ver, px, w * 4, w, h, v[2], v[3], scratch, 5, 4));
+    }
+}
+
+test "toI420Rows is the AVC444 main view as planes, in any bands" {
+    const gpa = std.testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x1420);
+    const sizes = [_][2]u32{ .{ 64, 32 }, .{ 33, 17 }, .{ 1, 1 }, .{ 130, 67 }, .{ 1920, 1080 } };
+    for (sizes) |sz| {
+        const w = sz[0];
+        const h = sz[1];
+        const stride = w * 4 + 8;
+        const px = try gpa.alloc(u8, stride * h);
+        defer gpa.free(px);
+        prng.random().bytes(px);
+        const vs = try viewSize(.v1, w, h);
+        const n = vs.width * vs.height;
+        const nv = try gpa.alloc(u8, n + n / 2);
+        defer gpa.free(nv);
+        const main: Nv12 = .{ .y = nv[0..n], .y_pitch = vs.width, .uv = nv[n..], .uv_pitch = vs.width };
+        const scratch = try gpa.alloc(u8, nv12ScratchLen(w));
+        defer gpa.free(scratch);
+        try toNv12(.v1, px, stride, w, h, main, null, scratch);
+
+        const ps = try i420Size(w, h);
+        const pw = ps.width;
+        const yp = try gpa.alloc(u8, pw * ps.height);
+        defer gpa.free(yp);
+        const up = try gpa.alloc(u8, pw / 2 * ps.height / 2);
+        defer gpa.free(up);
+        const vp = try gpa.alloc(u8, pw / 2 * ps.height / 2);
+        defer gpa.free(vp);
+        const out: I420 = .{ .y = yp, .y_pitch = pw, .u = up, .v = vp, .uv_pitch = pw / 2 };
+        const pairs = ps.height / 2;
+        var at: usize = 0;
+        while (at < pairs) : (at += 7) try toI420Rows(px, stride, w, h, out, scratch, at, @min(at + 7, pairs));
+        try std.testing.expectEqual(vs.width, pw);
+        for (0..ps.height) |y| try std.testing.expectEqualSlices(u8, nv[y * pw ..][0..pw], yp[y * pw ..][0..pw]);
+        for (0..pairs) |y| for (0..pw / 2) |x| {
+            try std.testing.expectEqual(main.uv[y * pw + 2 * x], up[y * pw / 2 + x]);
+            try std.testing.expectEqual(main.uv[y * pw + 2 * x + 1], vp[y * pw / 2 + x]);
+        };
+        try std.testing.expectError(error.InvalidDimensions, toI420Rows(px, stride, w, h, out, scratch, 0, pairs + 1));
     }
 }
 

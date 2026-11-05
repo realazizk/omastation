@@ -9,13 +9,14 @@ const policy = @import("codec_policy.zig");
 const pacing = @import("pacing.zig");
 const avc420 = @import("../codec/avc420.zig");
 const avc444 = @import("../codec/avc444.zig");
-const vaapi_h264 = @import("../codec/vaapi_h264.zig");
+const h264 = @import("../codec/h264.zig");
 const progressive = @import("../codec/progressive.zig");
 const rfx = @import("../codec/rfx.zig");
 const clear = @import("../codec/clear.zig");
 const encoder_mod = @import("encoder.zig");
 const workers = @import("../codec/workers.zig");
 const video_mod = @import("video.zig");
+const gpucap = @import("../gpu/capture.zig");
 const conn_mod = @import("conn.zig");
 const Conn = conn_mod.Conn;
 
@@ -44,12 +45,15 @@ pub const thin_kbps: u64 = 2000;
 /// Codec state of one RDPGFX surface; decoders keep theirs per surface.
 pub const Surface = struct {
     /// AVC420, or AVC444 when opts.avc444 is set.
-    h264: ?vaapi_h264.Encoder = null,
+    h264: ?h264.Encoder = null,
     h264_out: std.ArrayList(u8) = .empty,
     aux_out: std.ArrayList(u8) = .empty,
     need_idr: bool = true,
     /// AVC444 chroma owed after luma-only frames (LC 1, 2.2.4.5).
     chroma: ?avc444.ChromaDebt = null,
+    /// When this surface last sent an AVC444 frame (ms), or null: content coded again within two
+    /// frame intervals is moving, and goes as luma alone.
+    avc444_ms: ?i64 = null,
     prog: ?progressive.Encoder = null,
     /// codecContextId of `prog` (2.2.2.2), and whether the client has it.
     prog_ctx: u32 = 0,
@@ -77,10 +81,17 @@ pub const Surface = struct {
     /// The shadow, copied in only where a frame is coded with H.264 (whole when `h264_src_ok` is false).
     h264_src: []u8 = &.{},
     h264_src_ok: bool = false,
+    /// The frame's GPU capture, only while it is sent: H.264 input is written from it on the GPU.
+    gpu: ?gpucap.Handle = null,
+    /// The VA-API encoder (`instance`) whose input surfaces hold the H.264 source as the GPU last
+    /// wrote it (`h264_src` is stale then); 0: none, the next GPU write is whole.
+    gpu_src: u64 = 0,
     /// Scratch for a frame's rects: lossless pieces, H.264 region rects.
     pieces: std.ArrayList(Piece) = .empty,
     avc_rects: std.ArrayList(gfx.Rect16) = .empty,
     piece_rects: std.ArrayList(gfx.Rect16) = .empty,
+    /// Scratch: the rects of a frame's pieces, brought into the shadow together.
+    fresh_rects: std.ArrayList(gfx.Rect16) = .empty,
     /// writePieces scratch: the wire pieces, a batch's planar rects and their bitmaps.
     work: std.ArrayList(Work) = .empty,
     batch_rects: std.ArrayList(gfx.Rect16) = .empty,
@@ -102,6 +113,7 @@ pub const Surface = struct {
         s.pieces.deinit(gpa);
         s.avc_rects.deinit(gpa);
         s.piece_rects.deinit(gpa);
+        s.fresh_rects.deinit(gpa);
         s.work.deinit(gpa);
         s.batch_rects.deinit(gpa);
         s.batch_bufs.deinit(gpa);
@@ -117,9 +129,11 @@ pub const Surface = struct {
         s.need_idr = true;
         @memset(s.ref_qp, no_ref);
         s.h264_src_ok = false;
+        s.gpu_src = 0;
         s.video.forget();
         s.region_h264 = false;
         if (s.chroma) |*d| d.rects.clearRetainingCapacity();
+        s.avc444_ms = null;
         if (s.prog) |*p| p.deinit();
         s.prog = null;
         s.prog_live = false;
@@ -193,6 +207,22 @@ pub fn videoCodec(c: *const Conn) ?policy.Motion {
     return if (m.h264()) m else null;
 }
 
+/// Which changed tiles GPU capture may leave on the GPU this frame (lazy readback): those H.264
+/// will likely code from the GPU (`gpuInput`): all of them while motion holds, else the video
+/// region's. A wrong guess costs a readback when something reads them.
+pub fn readbackHint(c: *const Conn, out: *const gpucap.Output) gpucap.Hint {
+    if (!c.ch.gfx_ready or c.reactivating or c.output_suppressed) return .none;
+    const s = &c.ch.surf;
+    const h = if (s.h264) |*h| h else return .none;
+    const va = h.vaapiConst() orelse return .none;
+    if (!out.h264Possible(va)) return .none;
+    const m = motionCodec(c) orelse return .none;
+    if (m != @as(policy.Motion, if (h.opts.avc444 != null) .avc444v2 else .avc420)) return .none;
+    if (c.ch.motion_frames > 0) return .all;
+    const r = s.video.region() orelse return .none;
+    return .{ .region = .{ .left = r.left, .top = r.top, .right = r.right, .bottom = r.bottom } };
+}
+
 /// Tests run detections on their own clock.
 pub var video_clock: *const fn () i64 = &conn_mod.nowMs;
 
@@ -218,7 +248,7 @@ pub fn tickVideo(c: *Conn) void {
     const e = &c.enc;
     if (s.video.width != e.width or s.video.height != e.height or e.width == 0) return;
     const was = s.video.region();
-    const ev = s.video.tick(video_clock(), .{ .pixels = e.shadow, .stride = e.shadowStride(), .width = e.width, .height = e.height }) orelse return;
+    const ev = s.video.tick(video_clock(), .{ .pixels = e.shadow, .stride = e.shadowStride(), .width = e.width, .height = e.height, .fresh = .{ .ctx = e, .func = freshenForVideo } }) orelse return;
     switch (ev) {
         .started => {
             // A motion hold the video started ends: its changes have the region now.
@@ -233,6 +263,12 @@ pub fn tickVideo(c: *Conn) void {
             log.info("{s}: video region {d}x{d} at {d},{d} ended; refined", .{ c.peer, r.right - r.left, r.bottom - r.top, r.left, r.top });
         },
     }
+}
+
+/// The detector reads a candidate region's pixels: the shadow must hold them.
+fn freshenForVideo(ctx: *anyopaque, r: gfx.Rect16) void {
+    const e: *encoder_mod.Encoder = @ptrCast(@alignCast(ctx));
+    e.freshen(&.{r}) catch e.invalidate();
 }
 
 /// No H.264 any more: no video region; what it showed is refined losslessly.
@@ -266,6 +302,8 @@ pub fn writeFrame(c: *Conn, w: *bytes.Writer, sid: u16, motion: bool, region: ?g
         if (videoCodec(c) != null) return writeMixed(c, w, sid, v);
     }
     try writeLossless(c, w, sid, .owed);
+    // Moving content stopped (what this frame sent losslessly owes no chroma any more).
+    _ = try payChromaAtStop(c, w, sid);
     return .lossless;
 }
 
@@ -361,11 +399,32 @@ pub fn subtract(a: gfx.Rect16, b: gfx.Rect16, out: *[4]gfx.Rect16) []const gfx.R
     return out[0..n];
 }
 
+/// The H.264 picture written into VA-API's input surfaces on the GPU (AVC420's picture, AVC444's
+/// views), from the frame's GPU capture (no readback, upload or conversion on the CPU), as
+/// h264Source would build it: the blocks under `content`, whole when the surfaces do not hold the
+/// last picture. A refinement (no content) codes the surfaces as they are. False: the CPU builds
+/// it (software H.264, no GPU frame, failure).
+fn gpuInput(c: *Conn, h: *h264.Encoder, content: []const gfx.Rect16) bool {
+    const s = &c.ch.surf;
+    const va = h.vaapi() orelse return false;
+    const kept = s.gpu_src == va.instance;
+    if (s.gpu) |g| return g.out.writeH264Input(va, &c.enc, if (kept) content else null);
+    return kept and content.len == 0;
+}
+
+/// After a picture is coded: whether its input surfaces hold it as the GPU wrote it.
+fn noteGpuInput(c: *Conn, h: *h264.Encoder, gpu_in: bool) void {
+    const s = &c.ch.surf;
+    s.gpu_src = if (gpu_in) h.vaapi().?.instance else 0;
+    if (gpu_in) s.h264_src_ok = false;
+}
+
 /// The H.264 picture: the shadow's pixels of `rects` copied in, out to the 16-pixel macroblock
 /// grid; the rest keeps what was coded before. Whole after a reset or a new size.
 fn h264Source(c: *Conn, rects: []const gfx.Rect16) ![]const u8 {
     const s = &c.ch.surf;
     const e = &c.enc;
+    if (s.h264_src_ok and s.h264_src.len == e.shadow.len) try e.freshen(rects) else try e.freshenAll();
     if (s.h264_src.len != e.shadow.len) {
         c.gpa.free(s.h264_src);
         s.h264_src = &.{};
@@ -415,9 +474,12 @@ fn dropCodec(c: *Conn, w: *bytes.Writer, sid: u16, m: policy.Motion, err: anyerr
             if (s.h264) |*h| h.deinit();
             s.h264 = null;
             s.need_idr = true;
-            // No VA-API H.264 at all: H.264 off (channels.avcAllowed).
-            if (m == .avc420 or err == error.OpenDevice or err == error.VaInit) c.ch.avc_off = true;
-            log.warn("{s}: {s} unavailable ({t}); next codec", .{ c.peer, policy.motionName(m), err });
+            // No H.264 encoder at all (no VA-API device, no OpenH264): H.264 off (channels.avcAllowed).
+            const no_device = err == error.OpenDevice or err == error.VaInit;
+            if (m == .avc420 or no_device) c.ch.avc_off = true;
+            var buf: [96]u8 = undefined;
+            const why = if (no_device) h264.vaapiMissing(c.vc.opts.graphics.vaapi_device, err, &buf) else if (err == error.Unavailable) "no usable libopenh264" else @errorName(err);
+            log.warn("{s}: {s} unavailable ({s}); next codec", .{ c.peer, policy.motionName(m), why });
         },
         .progressive => {
             if (s.prog_live) progressive.writeDeleteEncodingContext(w, sid, s.prog_ctx) catch |e| return progError(e);
@@ -559,7 +621,7 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     };
     const r = nominal(c);
     if (s.h264 == null) {
-        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = crop, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device });
+        s.h264 = try h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = crop, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device }, c.vc.opts.graphics.h264_encoder);
         s.need_idr = true;
         // The refinement wait is picked once, from the link's rate, as Windows' encoder does.
         const rate = c.flow.rate() * 8;
@@ -598,9 +660,11 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     if (s.avc_region.items.len == 0) return error.NothingToRefine;
     h.setQp(qp);
     s.h264_out.clearRetainingCapacity();
-    const src = try h264Source(c, content);
     const mbs = if (idr) dirty_mbs else dirty_mbs + refinedMbs(c, qp);
-    const info = try h.encode(src, c.enc.shadowStride(), s.need_idr, &s.h264_out);
+    const gpu_in = gpuInput(c, h, content);
+    s.gpu_src = 0;
+    const info = if (gpu_in) try h.vaapi().?.encodeWritten(s.need_idr, &s.h264_out) else try h.encode(try h264Source(c, content), c.enc.shadowStride(), s.need_idr, &s.h264_out);
+    noteGpuInput(c, h, gpu_in);
     s.need_idr = false;
     noteRefs(c, qp, info.idr);
     avcSent(c, mbs, qp, info.idr, info.size);
@@ -620,8 +684,10 @@ fn writeAvc420(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16, 
     }
 }
 
-/// AVC444v2 (2.2.4.6): luma and chroma views of the whole surface in one H.264 stream. Without budget
-/// for both, only luma goes (LC 1) and the chroma is owed until a frame fits (LC 2).
+/// AVC444v2 (2.2.4.6): luma and chroma views of the whole surface in one H.264 stream. Moving
+/// content, or a frame without budget for both views, sends luma alone (LC 1) and owes the chroma:
+/// paid with the next frame that sends both views, or once it stops on a slow link
+/// (`payChromaAtStop`); otherwise the lossless refinement of its tiles supersedes it.
 fn writeAvc444(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16) !void {
     const s = &c.ch.surf;
     const width = c.enc.width;
@@ -633,7 +699,7 @@ fn writeAvc444(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16) 
     const r = nominal(c);
     if (s.h264 == null) {
         // Init probes AVC444 on the device: error.Unsupported drops to AVC420.
-        s.h264 = try vaapi_h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = false, .avc444 = .v2, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device });
+        s.h264 = try h264.Encoder.init(c.gpa, .{ .width = width, .height = height, .bitrate = r.bitrate, .fps = r.fps, .crop = false, .avc444 = .v2, .rate_control = .cqp, .qp = pacing.avc_min_qp, .device = c.vc.opts.graphics.vaapi_device }, c.vc.opts.graphics.h264_encoder);
         s.need_idr = true;
         log.info("{s}: H.264 AVC444v2 encoder ready on {s} ({d}x{d}, QP per frame from its byte budget, {d} fps at most)", .{ c.peer, s.h264.?.node, width, height, r.fps });
     }
@@ -646,35 +712,105 @@ fn writeAvc444(c: *Conn, w: *bytes.Writer, sid: u16, rects: []const gfx.Rect16) 
     const debt = &s.chroma.?;
     const idr = s.need_idr;
     const mbs = updatedMbs(c, rects, idr);
-    // Both views at the minimum QP, or luma alone at the level that fits; Windows sends chroma once luma is done.
     try markDirty(c, rects);
-    const both_qp = chooseQp(c, mbs, idr, 2);
-    const both_fit = both_qp == pacing.avc_min_qp;
-    const q: struct { qp: u8 } = .{ .qp = if (both_fit) both_qp else chooseQp(c, mbs, idr, 1) };
-    h.setQp(q.qp);
+    // Content coded again within two frame intervals is moving (scrolling, a drag, a video region):
+    // its colour detail would be replaced by the next frame, and a client rebuilding 4:4:4 by the
+    // spec's formula shows coding noise worse than 4:2:0, so luma goes alone, as Windows does while
+    // content moves. Otherwise both views at the minimum QP if they fit the budget, else luma alone
+    // at the level that does.
+    const now = conn_mod.nowMs();
+    const both = !idr and !moving(s.avc444_ms, now, c.pacing.interval_ms) and chooseQp(c, mbs, idr, 2) == pacing.avc_min_qp;
+    h.setQp(if (both) pacing.avc_min_qp else chooseQp(c, mbs, idr, 1));
     s.h264_out.clearRetainingCapacity();
     s.aux_out.clearRetainingCapacity();
-    const src = try h264Source(c, rects);
-    const info = try h.encode444(src, c.enc.shadowStride(), s.need_idr, if (both_fit) .both else .luma, &s.h264_out, &s.aux_out);
+    const ask: avc444.Lc = if (both) .both else .luma;
+    const gpu_in = gpuInput(c, h, rects);
+    s.gpu_src = 0;
+    const info = if (gpu_in) try h.vaapi().?.encode444Written(s.need_idr, ask, &s.h264_out, &s.aux_out) else try h.encode444(try h264Source(c, rects), c.enc.shadowStride(), s.need_idr, ask, &s.h264_out, &s.aux_out);
+    noteGpuInput(c, h, gpu_in);
     s.need_idr = false;
+    s.avc444_ms = now;
     // An IDR codes both views whatever was asked.
     const main = info.main orelse return error.BadEncoderOutput;
     const lc: avc444.Lc = if (info.aux != null) .both else .luma;
+    if (lc == .luma) c.ch.stats.avc444_luma += 1;
     avcSent(c, mbs, main.avg_qp, main.idr, main.size);
     try writeAvc444Pdu(c, w, sid, lc, .{ .rects = rects, .qp = main.avg_qp, .h264 = s.h264_out.items }, if (info.aux) |a| .{ .rects = rects, .qp = a.avg_qp, .h264 = s.aux_out.items } else null);
     c.ch.stats.h264_bytes += s.h264_out.items.len + s.aux_out.items.len;
     try debt.sent(lc, rects);
-    if (lc != .both or !try debt.pending()) return;
-    // Chroma owed from earlier luma-only frames: an LC 2 bitmap.
-    var owed_buf: [16]avc420.Rect16 = undefined;
+    if (lc == .both) _ = try payChroma(c, w, sid);
+}
+
+/// An AVC444 frame within two frame intervals of the surface's last one codes moving content.
+fn moving(last_ms: ?i64, now_ms: i64, interval_ms: u32) bool {
+    const t = last_ms orelse return false;
+    return now_ms - t <= 2 * @as(i64, interval_ms);
+}
+
+/// Moving content stopped: on a slow link its owed chroma goes now, one LC 2 bitmap, since its
+/// lossless refinement takes a while there; on a fast one that refinement follows within a few
+/// hundred milliseconds and supersedes the debt (`writePieces`), so the chroma would be wasted.
+fn payChromaAtStop(c: *Conn, w: *bytes.Writer, sid: u16) conn_mod.Error!bool {
+    if (!c.ch.adapt.slow()) return false;
+    return payChroma(c, w, sid);
+}
+
+/// The chroma owed after luma-only frames, as an LC 2 bitmap coded from the picture those frames
+/// coded (`h264_src`, or the auxiliary view the GPU wrote with them; unchanged in owed areas:
+/// anything sent there since paid their debt). Without an AVC444 encoder to pay with, or if
+/// coding fails, the debt is dropped: its tiles are lossy and refined losslessly. False: nothing
+/// sent.
+fn payChroma(c: *Conn, w: *bytes.Writer, sid: u16) conn_mod.Error!bool {
+    const s = &c.ch.surf;
+    const debt = if (s.chroma) |*d| d else return false;
+    if (debt.rects.items.len == 0) return false;
+    const usable = if (s.h264) |*h| h.opts.avc444 != null and !s.need_idr and ((s.h264_src_ok and s.h264_src.len == c.enc.shadow.len) or gpuKept(s, h)) else false;
+    if (!usable) {
+        debt.rects.clearRetainingCapacity();
+        return false;
+    }
+    const start = w.len();
+    return writeChroma(c, w, sid) catch |err| {
+        if (err == error.OutOfMemory) return error.OutOfMemory;
+        // The encoder starts over with an IDR (both views); until then the lossy tiles are refined.
+        log.warn("{s}: AVC444 chroma for {d} owed rects failed: {t}", .{ c.peer, debt.rects.items.len, err });
+        w.list.shrinkRetainingCapacity(start);
+        s.need_idr = true;
+        debt.rects.clearRetainingCapacity();
+        return false;
+    };
+}
+
+fn writeChroma(c: *Conn, w: *bytes.Writer, sid: u16) !bool {
+    const s = &c.ch.surf;
+    const debt = &s.chroma.?;
+    const h = &s.h264.?;
+    var owed_buf: [avc444.ChromaDebt.max_rects]avc420.Rect16 = undefined;
     const owed = try debt.owed(&owed_buf);
+    h.setQp(chooseQp(c, updatedMbs(c, owed, false), false, 1));
+    s.h264_out.clearRetainingCapacity();
     s.aux_out.clearRetainingCapacity();
-    const pay = try h.encode444(src, c.enc.shadowStride(), false, .chroma, &s.h264_out, &s.aux_out);
+    const kept = gpuKept(s, h);
+    const pay = if (kept) try h.vaapi().?.encode444Written(false, .chroma, &s.h264_out, &s.aux_out) else try h.encode444(s.h264_src, c.enc.shadowStride(), false, .chroma, &s.h264_out, &s.aux_out);
+    log.debug("{s}: AVC444 chroma paid for {d} rects, from {s}", .{ c.peer, owed.len, if (kept) "the views the GPU wrote" else "the CPU's picture" });
     const aux = pay.aux orelse return error.BadEncoderOutput;
-    if (pay.main != null) return error.BadEncoderOutput; // an IDR here would desync the views
-    try writeAvc444Pdu(c, w, sid, .chroma, .{ .rects = owed, .qp = aux.avg_qp, .h264 = s.aux_out.items }, null);
-    c.ch.stats.h264_bytes += s.aux_out.items.len;
+    // A due IDR codes both views of the same picture: sent for the owed rects, it pays them too.
+    if (pay.main) |m| {
+        try writeAvc444Pdu(c, w, sid, .both, .{ .rects = owed, .qp = m.avg_qp, .h264 = s.h264_out.items }, .{ .rects = owed, .qp = aux.avg_qp, .h264 = s.aux_out.items });
+    } else try writeAvc444Pdu(c, w, sid, .chroma, .{ .rects = owed, .qp = aux.avg_qp, .h264 = s.aux_out.items }, null);
+    c.ch.stats.h264_bytes += s.h264_out.items.len + s.aux_out.items.len;
+    c.ch.stats.chroma_pays += 1;
     try debt.sent(.chroma, owed);
+    // The client shows H.264 there now. A merged debt can reach tiles already refined losslessly,
+    // so every tile it covered is lossy again, to be refined.
+    c.enc.markLossyKeepOwed(owed, encoder_mod.Encoder.lossy_other);
+    return true;
+}
+
+/// The encoder's input surfaces hold the H.264 source (written on the GPU).
+fn gpuKept(s: *const Surface, h: *h264.Encoder) bool {
+    const va = h.vaapi() orelse return false;
+    return s.gpu_src == va.instance;
 }
 
 fn writeAvc444Pdu(c: *Conn, w: *bytes.Writer, sid: u16, lc: avc444.Lc, s1: avc444.SubStream, s2: ?avc444.SubStream) !void {
@@ -699,6 +835,7 @@ fn progRects(c: *Conn, rects: []const gfx.Rect16) ![]const progressive.Rect {
 /// One WIRE_TO_SURFACE_PDU_2 with the surface's codecContextId.
 fn writeProgressive(c: *Conn, w: *bytes.Writer, sid: u16) !void {
     const s = &c.ch.surf;
+    try c.enc.freshen(c.enc.rects.items);
     if (s.prog) |p| if (p.width != c.enc.width or p.height != c.enc.height) {
         // A new size is a new surface (resetGraphics); a stale encoder must never code for another size.
         if (s.prog_live) try progressive.writeDeleteEncodingContext(w, sid, s.prog_ctx);
@@ -803,6 +940,7 @@ const Panes = struct {
 /// otherwise each size class codes in image mode, so no pane depends on another's headers.
 fn writeRemoteFx(c: *Conn, w: *bytes.Writer, sid: u16) !void {
     const s = &c.ch.surf;
+    try c.enc.freshen(c.enc.rects.items);
     const area = try budgetRects(c, c.ch.rfx_bpp_x100);
     const begin = w.len();
     defer c.ch.rfx_bpp_x100 = learnBpp(c.ch.rfx_bpp_x100, w.len() - begin, area);
@@ -898,6 +1036,12 @@ fn writePieces(c: *Conn, w: *bytes.Writer, sid: u16, pieces: []const Piece, left
     const e = &c.enc;
     const s = &c.ch.surf;
     const gpa = c.gpa;
+    // ClearCodec and planar read the pieces' pixels: bring the lagging ones in at once.
+    if (e.hasStale()) {
+        s.fresh_rects.clearRetainingCapacity();
+        for (pieces) |pc| try s.fresh_rects.append(gpa, pc.rect);
+        try e.freshen(s.fresh_rects.items);
+    }
     // Counted before ZGFX, which shrinks them by its recent ratio (or `limit`, the caller's).
     const raw = limit orelse c.ch.rawBudget(c.frameBudget());
     const paced = raw != std.math.maxInt(usize);
@@ -1063,6 +1207,7 @@ pub fn pendingOn(enc: *const encoder_mod.Encoder, surf: *const Surface) bool {
 /// (still screen), else an AVC420 pass at the next QP (38 -> 30 -> 22), else losslessly. False: nothing sent.
 pub fn writeRefine(c: *Conn, w: *bytes.Writer, sid: u16, now_ms: i64, quiet_ms: i64, still: bool) conn_mod.Error!bool {
     const s = &c.ch.surf;
+    if (still and try payChromaAtStop(c, w, sid)) return true;
     if (still) if (s.prog) |*p| {
         s.bitmap.clearRetainingCapacity();
         // Cut to the frame's budget: the other tiles keep their level.
@@ -1096,6 +1241,14 @@ pub fn writeRefine(c: *Conn, w: *bytes.Writer, sid: u16, now_ms: i64, quiet_ms: 
     // Cut to the frame budget: the rest stays lossy for the next step.
     try writeLossless(c, w, sid, .lossy);
     return true;
+}
+
+test "AVC444 content is moving when coded again within two frame intervals" {
+    try std.testing.expect(!moving(null, 1000, 31));
+    try std.testing.expect(moving(1000, 1031, 31));
+    try std.testing.expect(moving(1000, 1062, 31));
+    try std.testing.expect(!moving(1000, 1063, 31));
+    try std.testing.expect(!moving(1000, 5000, 31));
 }
 
 test "RemoteFX panes: at most 4096x2048, as even as possible, size classes" {

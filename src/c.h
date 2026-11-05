@@ -2,6 +2,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <unistd.h>
 #include <time.h>
 #include <sys/socket.h>
@@ -26,7 +27,14 @@
 #include <sys/un.h>
 #include <va/va.h>
 #include <va/va_drm.h>
+#include <va/va_drmcommon.h>
 #include <va/va_enc_h264.h>
+/* Software H.264 (src/codec/openh264.zig): the API of libopenh264, loaded at run time. */
+#include <wels/codec_api.h>
+#include <wels/codec_ver.h>
+/* GPU capture (src/gpu): dmabuf allocation, compute on the captured frames. */
+#include <gbm.h>
+#include <vulkan/vulkan.h>
 #include <linux/input.h>
 #include <linux/uinput.h>
 #include <sys/inotify.h>

@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const system_libs = [_][]const u8{ "ssl", "crypto", "pam", "va", "va-drm", "xkbcommon", "opus", "fdk-aac", "gsm", "fuse3", "pipewire-0.3" };
+pub const system_libs = [_][]const u8{ "ssl", "crypto", "pam", "va", "va-drm", "gbm", "vulkan", "xkbcommon", "opus", "fdk-aac", "gsm", "fuse3", "pipewire-0.3" };
 
 // For translate-c: headers outside /usr/include.
 const system_include_dirs = [_][]const u8{ "/usr/include/pipewire-0.3", "/usr/include/spa-0.2" };
@@ -66,6 +66,28 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     run_bench.addPassthruArgs();
     b.step("bench", "Time the CPU codecs (RemoteFX, progressive) on synthetic frames").dependOn(&run_bench.step);
+
+    // `zig build capbench -- --output NAME --mode dmabuf`: what capturing an output costs, the
+    // compositor's side included (src/capbench.zig); run it against a nested compositor.
+    const capbench = b.addExecutable(.{
+        .name = "omastation-capbench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/capbench.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "omastation", .module = lib_mod },
+                .{ .name = "c", .module = c_mod },
+            },
+        }),
+    });
+    for (system_libs) |l| capbench.root_module.linkSystemLibrary(l, .{});
+    const run_capbench = b.addRunArtifact(capbench);
+    run_capbench.addPassthruArgs();
+    const capbench_step = b.step("capbench", "Measure output capture (shm or dmabuf) against WAYLAND_DISPLAY");
+    capbench_step.dependOn(&b.addInstallArtifact(capbench, .{}).step);
+    capbench_step.dependOn(&run_capbench.step);
 
     const test_filters = b.option([]const []const u8, "test-filter", "unit tests: only those whose name contains this") orelse &.{};
     const lib_tests = b.addTest(.{ .root_module = lib_mod, .filters = test_filters });

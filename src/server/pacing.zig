@@ -45,6 +45,8 @@ pub const log_interval_ms: i64 = 5000;
 pub const slow_pass_ms: u32 = 100;
 /// How long the session's last output may wait for the wire when the server ends it.
 pub const drain_at_end_ms: i64 = 2000;
+/// Frames start no closer than this many H.264 encode times (`State.frameGapMs`).
+pub const encode_gap: f64 = 1.25;
 
 /// Piece width for `budget`: whole tiles (1 to 8) of raw planar (3 bytes a pixel, 64 rows).
 pub fn pieceWidth(budget: usize) u16 {
@@ -132,6 +134,8 @@ pub const State = struct {
     retry_ms: ?i64 = null,
     /// H.264 encode time estimate (ms), deducted from H.264 budgets only.
     encode_ms: f64 = 5,
+    /// The last frame was H.264: the next starts `encode_gap` encode times after it.
+    h264_last: bool = false,
     avc: AvcModel = .{},
     stats: Stats = .{},
     logged_ms: i64 = 0,
@@ -195,7 +199,7 @@ pub const State = struct {
         if (r) |why| {
             // Retry after an interval, or the rest of it; flow.zig retries at once when data goes.
             const ms: i64 = switch (why) {
-                .interval => @max(1, @as(i64, s.interval_ms) - (now_ms - s.frame_start_ms) - interval_slack_ms),
+                .interval => @max(1, s.frameGapMs() - (now_ms - s.frame_start_ms) - interval_slack_ms),
                 .client, .network => s.interval_ms,
             };
             s.retry_ms = if (s.retry_ms) |x| @min(x, ms) else ms;
@@ -206,7 +210,7 @@ pub const State = struct {
 
     fn check(s: *State, now_ms: i64, unacked: ?u32, rtt_ms: ?u32) ?Refusal {
         const since = now_ms - s.frame_start_ms;
-        if (since + interval_slack_ms < s.interval_ms) return .interval;
+        if (since + interval_slack_ms < s.frameGapMs()) return .interval;
         if (unacked) |n| {
             if (!s.clientReady(n, rtt_ms)) return .client;
             // While the client is slower than the target, frames no closer than its interval.
@@ -249,9 +253,17 @@ pub const State = struct {
         return @min(s.budget(now_ms, s.encode_ms), cap);
     }
 
-    /// An encode took `ms`: the estimate becomes 0.75 new + 0.25 old, at most 10x the old.
+    /// Frames start at least this far apart: the interval, or 1.25 x the H.264 encode time when
+    /// that is longer, so a slow (software) encoder leaves the loop time for input between frames.
+    pub fn frameGapMs(s: *const State) i64 {
+        if (!s.h264_last) return s.interval_ms;
+        return @max(@as(i64, s.interval_ms), @as(i64, @intFromFloat(@ceil(encode_gap * s.encode_ms))));
+    }
+
+    /// An H.264 encode took `ms`: the estimate becomes 0.75 new + 0.25 old, at most 10x the old.
     pub fn encoded(s: *State, ms: f64) void {
         s.encode_ms = @min(0.75 * ms + 0.25 * s.encode_ms, 10 * @max(s.encode_ms, 1));
+        s.h264_last = true;
     }
 
     /// Frame Acknowledge queueDepth (MS-RDPEGFX 2.2.2.13): adjusts the client interval estimate.
@@ -418,6 +430,20 @@ test "budget: (2 x interval - elapsed - max(drain, encode)) x rate; H.264 capped
     l.frameStarted(0);
     try testing.expect(l.budget(0, l.encode_ms) > 7_000_000);
     try testing.expectEqual(@as(usize, 116_250), l.avcBudget(0));
+}
+
+test "a slow H.264 encode stretches the gap between frames, a fast one does not" {
+    var s: State = .{};
+    s.frameStarted(0);
+    s.encoded(8); // a GPU encode: the interval rules
+    try testing.expectEqual(@as(i64, default_interval_ms), s.frameGapMs());
+    try testing.expect(s.admit(default_interval_ms, null, null));
+    s.frameStarted(100);
+    for (0..8) |_| s.encoded(40); // software at 4K
+    try testing.expectEqual(@as(i64, 50), s.frameGapMs());
+    try testing.expect(!s.admit(100 + default_interval_ms, null, null));
+    try testing.expectEqual(Refusal.interval, s.refusal.?);
+    try testing.expect(s.admit(100 + 50 - interval_slack_ms, null, null));
 }
 
 test "QP range 22..38, mid 30, quality step 18" {

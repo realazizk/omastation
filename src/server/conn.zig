@@ -72,6 +72,8 @@ pub const DesktopConfig = struct {
     console_state_path: ?[:0]const u8 = null,
     capture_backend: wl_capture.Backend = .ext,
     cursor: desktop_mod.CursorMode = .auto,
+    /// Capture into dmabufs, changes found on the GPU (src/gpu/capture.zig).
+    gpu_capture: bool = false,
 };
 
 /// Covers clients' auto-reconnect attempts (about 20, 5 s apart) plus drop detection on both sides.
@@ -149,6 +151,8 @@ pub const Conn = struct {
     width: u16 = 0,
     height: u16 = 0,
     deadline: deadline.Handle = .{},
+    /// When the connection sequence began (the connection was taken up).
+    sequence_start_ms: i64 = 0,
     netchar: autodetect.State = .{},
     bulk: compression.State = .{},
     /// Finalization done (Font Map sent).
@@ -194,6 +198,8 @@ pub const Conn = struct {
         self.lingering = self.mayLinger();
         // The features first: they may use the desktop.
         vc.deinit(self);
+        // The encoder's links to the desktop's GPU capture, while this thread still owns it.
+        self.enc.releaseShadow();
         // Hand the desktop to a connection taking over, or lock and give the console back, first.
         if (self.claim) |*cl| {
             const seat = self.desktop_cfg.?.seat;
@@ -443,7 +449,8 @@ pub const Conn = struct {
     }
 
     pub fn run(self: *Conn) Error!void {
-        self.deadline = deadline.start(self.t.fd, nowMs());
+        self.sequence_start_ms = nowMs();
+        self.deadline = deadline.start(self.t.fd, self.sequence_start_ms);
         try self.negotiate();
         try self.mcsConnect();
         try self.channelJoins();
@@ -872,6 +879,7 @@ pub const Conn = struct {
             .console_state_path = cfg.console_state_path,
             .capture_backend = cfg.capture_backend,
             .cursor = cfg.cursor,
+            .gpu_capture = cfg.gpu_capture,
             .layout = layout,
         };
         self.claim = seat_mod.Claim.init() catch return error.DesktopFailed;
@@ -1174,7 +1182,7 @@ pub const Conn = struct {
                 self.odd_size_since_ms = null;
                 self.odd_size_taken = false;
             }
-            channels.sendDesktopFrame(self, f) catch |err| switch (err) {
+            channels.sendDesktopFrame(self, f, d.frameSource(0).gpu()) catch |err| switch (err) {
                 // A malformed frame is skipped; the client keeps its picture.
                 error.InvalidDimensions => log.warn("{s}: skipping a {d}x{d} frame with stride {d} and {d} bytes", .{ self.peer, f.width, f.height, f.stride, f.data.len }),
                 else => return err,
@@ -1236,9 +1244,9 @@ pub const Conn = struct {
                     try self.sendIo(rdp.writeFontMap, .{});
                 }
                 if (self.reactivating) {
-                    // Reactivated (1.3.1.3): the whole picture again.
+                    // Reactivated (1.3.1.3): the whole picture again, or another reactivation.
                     self.reactivating = false;
-                    return channels.refresh(self);
+                    return channels.reactivated(self);
                 }
                 deadline.stop(&self.deadline);
                 log.info("{s}: connection established", .{self.peer});

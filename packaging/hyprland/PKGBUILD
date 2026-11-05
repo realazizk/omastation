@@ -1,5 +1,8 @@
-# Arch's hyprland PKGBUILD (0.56.2-4) plus omastation's patch: the cursor capture returns the
-# real cursor image, so RDP clients draw the pointer themselves. Replaces the installed
+# Arch's hyprland PKGBUILD (0.56.2-4) plus omastation's patches: the cursor capture returns the
+# real cursor image, so RDP clients draw the pointer themselves (0001); a capture request that
+# reaches Hyprland after its output was removed no longer crashes it (0002-0004: a null check
+# in place of upstream's #15714, a backport of #16533, and cursor sessions stopped when their
+# output goes, still missing upstream). Replaces the installed
 # hyprland (makepkg -si); Arch's next hyprland release replaces it again. Only the hyprland
 # package is built: Arch ships hyprpm separately, and this package leaves its files out.
 #
@@ -10,8 +13,8 @@
 
 pkgname=hyprland
 pkgver=0.56.2
-pkgrel=4.1
-pkgdesc='a highly customizable dynamic tiling Wayland compositor (with omastation'"'"'s cursor capture patch)'
+pkgrel=4.2
+pkgdesc='a highly customizable dynamic tiling Wayland compositor (with omastation'"'"'s cursor capture and capture crash patches)'
 arch=(x86_64 aarch64)
 url="https://github.com/hyprwm/${pkgname^}"
 license=(BSD-3-Clause)
@@ -71,16 +74,25 @@ optdepends=('hyprpm: build and install plugins'
 provides=(wayland-compositor)
 _archive="${pkgname^}-$pkgver"
 source=("$_archive.tar.gz::$url/releases/download/v$pkgver/source-v$pkgver.tar.gz"
-        0001-screenshare-capture-cursor-images.patch)
+        0001-screenshare-capture-cursor-images.patch
+        0002-screenshare-transform-of-a-gone-monitor.patch
+        0003-cursorshare-no-copy-through-a-disabled-monitor.patch
+        0004-cursor-session-stopped-when-its-output-goes.patch)
 sha256sums=('03ad3f5ef152ff44116ffd56fcf808486211ecabf4f0ba567108ee746ba5cd2e'
-            'eb4da04f349aad258caf7fb60c77d0276dcae0dd15eb9f4f9d4b550fc1e6ac10')
+            'eb4da04f349aad258caf7fb60c77d0276dcae0dd15eb9f4f9d4b550fc1e6ac10'
+            'd13aeda743ba87af0beeaf0056f333f648372e5c7927e46d7176d2b3904dc8a5'
+            '079d0d7d8f74adfed80c0ad73c1a26b05dd9e665e37b552020a3c17be8a7a392'
+            '1e6ad93bedaa3ab34eb5b365badde5d28fb55e3030bd7099753f3b2cbab2d4c1')
 
 prepare() {
 	ln -sf hyprland-source "$_archive"
 	cd "$_archive"
 	sed -i -e '/^release:/{n;s/-D/-DCMAKE_SKIP_RPATH=ON -D/}' Makefile
 	sed -i -e '/find_package.glaze/s/7...<8 //' {.,hyprpm,start}/CMakeLists.txt
-	patch -Np1 -i "$srcdir/0001-screenshare-capture-cursor-images.patch"
+	local p
+	for p in "${source[@]:1}"; do
+		patch -Np1 -i "$srcdir/$p"
+	done
 }
 
 build() {

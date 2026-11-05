@@ -1,0 +1,63 @@
+#version 450
+// BGRX → NV12 for the H.264 encoder's input surface (src/gpu/nv12.zig), bit-exact with
+// avc444.toI420Rows: full-range BT.709 in 16.16 fixed point, chroma the rounded average of the
+// four full-resolution samples, edges replicated. One invocation per 2x2 pixel quad, a workgroup
+// per 16x16 block; only blocks `blocks` flags are written (the H.264 rects, 16-aligned as
+// h264Source copies them), the rest of the surface keeps its picture. Rebuild: ./build.sh.
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Src { uint src[]; };
+layout(std430, set = 0, binding = 1) readonly buffer Blocks { uint blocks[]; };
+layout(set = 0, binding = 2, r8) uniform writeonly image2D y_img;
+layout(set = 0, binding = 3, rg8) uniform writeonly image2D uv_img;
+
+layout(push_constant) uniform Params {
+    uint width;      // source picture
+    uint height;
+    uint src_offset; // 32-bit words
+    uint src_stride;
+    uint blocks_x;
+    uint all;        // 1: every block
+    uint out_w;      // the surface's luma size
+    uint out_h;
+} p;
+
+const int k_yr = 13933;
+const int k_yg = 46871;
+const int k_yb = 4732;
+const int k_ur = -7510;
+const int k_ug = -25258;
+const int k_ub = 32768;
+const int k_vr = 32768;
+const int k_vg = -29766;
+const int k_vb = -3002;
+
+int fixv(int v) {
+    return clamp((v + 32768) >> 16, 0, 255);
+}
+
+void main() {
+    uvec2 b = gl_WorkGroupID.xy;
+    if (p.all == 0u && blocks[b.y * p.blocks_x + b.x] == 0u) return;
+    uint x = gl_GlobalInvocationID.x * 2u;
+    uint y = gl_GlobalInvocationID.y * 2u;
+    if (x >= p.out_w || y >= p.out_h) return;
+    int us = 0;
+    int vs = 0;
+    for (uint dy = 0u; dy < 2u; dy++) {
+        for (uint dx = 0u; dx < 2u; dx++) {
+            uint sx = min(x + dx, p.width - 1u);
+            uint sy = min(y + dy, p.height - 1u);
+            uint px = src[p.src_offset + sy * p.src_stride + sx];
+            int bl = int(px & 0xFFu);
+            int g = int((px >> 8) & 0xFFu);
+            int r = int((px >> 16) & 0xFFu);
+            us += fixv(k_ur * r + k_ug * g + k_ub * bl + (128 << 16));
+            vs += fixv(k_vr * r + k_vg * g + k_vb * bl + (128 << 16));
+            if (x + dx < p.out_w && y + dy < p.out_h)
+                imageStore(y_img, ivec2(x + dx, y + dy), vec4(float(fixv(k_yr * r + k_yg * g + k_yb * bl)) / 255.0));
+        }
+    }
+    imageStore(uv_img, ivec2(x / 2u, y / 2u), vec4(float((us + 2) >> 2) / 255.0, float((vs + 2) >> 2) / 255.0, 0.0, 0.0));
+}
